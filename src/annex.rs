@@ -228,11 +228,6 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn run_git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let s = run_git(repo, args)?;
-    Ok(s.lines().map(|l| l.to_string()).collect())
-}
-
 /// Parse a simple space separated log like "uuid desc timestamp=123s"
 fn parse_uuid_log(text: &str) -> Vec<(String, String, Option<i64>)> {
     let mut out = vec![];
@@ -389,17 +384,6 @@ fn parse_content_log(text: &str) -> HashMap<String, String> {
         }
     }
     m
-}
-
-fn extract_key_from_pointer(ptr: &str) -> Option<String> {
-    // e.g. .git/annex/objects/xx/yy/KEY/KEY  -> KEY
-    let p = ptr.trim();
-    if let Some(last) = p.rsplit('/').next() {
-        if last.contains("--") || last.starts_with("SHA") || last.starts_with("WORM") || last.starts_with("MD5") {
-            return Some(last.to_string());
-        }
-    }
-    None
 }
 
 pub fn parse_size_from_key(key: &str) -> Option<u64> {

@@ -30,7 +30,7 @@ pub fn spawn(
 
     thread::spawn(move || {
         // meta_rx moved into this worker thread for draining results
-        let mut meta_rx = meta_rx;
+        let meta_rx = meta_rx;
         let mut worker = Worker { app: App::new(scan_root.clone()) };
 
         // 1. Try cache first for instant UI
