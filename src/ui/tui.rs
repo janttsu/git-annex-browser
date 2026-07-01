@@ -6,7 +6,7 @@ use crate::app::ViewSnapshot;
 use crossterm::{
     cursor::{Hide, Show},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear as CrosstermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem as RatListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem as RatListItem, ListState, Paragraph, Wrap},
 };
 use std::{io::{Result as IoResult, Stdout, stdout}, panic};
 
@@ -49,8 +49,10 @@ impl TerminalGuard {
         }));
         enable_raw_mode()?;
         let mut out = stdout();
-        execute!(out, EnterAlternateScreen, Hide)?;
-        Ok(Self { term: Terminal::new(CrosstermBackend::new(out))? })
+        execute!(out, EnterAlternateScreen, CrosstermClear(ClearType::All), Hide)?;
+        let mut term = Terminal::new(CrosstermBackend::new(out))?;
+        term.clear()?;
+        Ok(Self { term })
     }
 }
 
@@ -73,6 +75,9 @@ pub fn draw(
     show_raw: bool,
     detail_scroll: usize,
 ) {
+    // Clear the screen on every frame to prevent old terminal content from showing through.
+    frame.render_widget(Clear, frame.area());
+
     let Some(snap) = snap else {
         let msg = Paragraph::new("scanning for annex repos…")
             .block(Block::default().borders(Borders::ALL).title(" git-annex-browser "));
