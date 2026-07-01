@@ -8,9 +8,8 @@ use crate::annex::{self, AnnexMetadata, RepoSummary};
 use crate::node::{Node, RepoLoadingNode, RepoNode, RootNode};
 use anyhow::Result;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -78,7 +77,7 @@ impl App {
     }
 
     /// Build a fresh snapshot-friendly view from current selection path.
-    pub fn snapshot(&self, page: usize) -> ViewSnapshot {
+    pub fn snapshot(&self, _page: usize) -> ViewSnapshot {
         let level = self.stack.last().unwrap();
         let kids = level.node.children();
         let sel = level.selected.min(kids.len().saturating_sub(1));
