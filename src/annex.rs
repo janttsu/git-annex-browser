@@ -109,6 +109,12 @@ pub struct AnnexMetadata {
     pub files: Vec<AnnexedFile>,
     /// total keys known (from location logs)
     pub total_keys: usize,
+    /// Sum of sizes of all unique keys (deduplicated size)
+    #[serde(default)]
+    pub unique_size: u64,
+    /// Total storage consumed across all drives (size × number of copies)
+    #[serde(default)]
+    pub consumed_size: u64,
 }
 
 /// Lightweight summary for fast top-level listing and caching.
@@ -126,6 +132,12 @@ pub struct RepoSummary {
     pub remote_count: usize,
     pub here_present_count: usize,
     pub here_available_space: Option<u64>,
+    /// Sum of sizes of all unique keys (1 copy each)
+    #[serde(default)]
+    pub unique_size: u64,
+    /// Total space used across all drives (with duplicates counted per copy)
+    #[serde(default)]
+    pub consumed_size: u64,
 }
 
 impl AnnexMetadata {
@@ -144,6 +156,37 @@ impl AnnexMetadata {
             remote_count: self.remotes.len(),
             here_present_count: here_present,
             here_available_space: None, // no longer populated
+            unique_size: self.unique_size,
+            consumed_size: self.consumed_size,
+        }
+    }
+
+    /// Ensure size stats are populated (for old caches that didn't have them)
+    pub fn ensure_sizes(&mut self) {
+        if self.unique_size == 0 && self.consumed_size == 0 && !self.locations.is_empty() {
+            let mut key_sizes: HashMap<String, u64> = HashMap::new();
+            for f in &self.files {
+                if let Some(sz) = f.size {
+                    key_sizes.insert(f.key.clone(), sz);
+                }
+            }
+            for key in self.locations.keys() {
+                if !key_sizes.contains_key(key) {
+                    if let Some(sz) = parse_size_from_key(key) {
+                        key_sizes.insert(key.clone(), sz);
+                    }
+                }
+            }
+            let mut u = 0u64;
+            let mut c = 0u64;
+            for (key, uuids) in &self.locations {
+                if let Some(&sz) = key_sizes.get(key) {
+                    u += sz;
+                    c += sz * (uuids.len() as u64);
+                }
+            }
+            self.unique_size = u;
+            self.consumed_size = c;
         }
     }
 }
@@ -666,6 +709,31 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
 
     let total_keys = locations.len().max(files.len());
 
+    // Build sizes for all known keys (from working tree + parse from key names for unused)
+    let mut key_sizes: HashMap<String, u64> = HashMap::new();
+    for f in &files {
+        if let Some(sz) = f.size {
+            key_sizes.insert(f.key.clone(), sz);
+        }
+    }
+    for key in locations.keys() {
+        if !key_sizes.contains_key(key) {
+            if let Some(sz) = parse_size_from_key(key) {
+                key_sizes.insert(key.clone(), sz);
+            }
+        }
+    }
+
+    // Compute storage report
+    let mut unique_size = 0u64;
+    let mut consumed_size = 0u64;
+    for (key, uuids) in &locations {
+        if let Some(&sz) = key_sizes.get(key) {
+            unique_size += sz;
+            consumed_size += sz * (uuids.len() as u64);
+        }
+    }
+
     // Fill local desc if empty
     let description = if desc.is_empty() {
         uuid_entries.iter().find(|(u,_d,_)| u == &uuid).map(|(_,d,_)| d.clone()).unwrap_or_else(|| uuid.clone())
@@ -682,6 +750,8 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         locations,
         files,
         total_keys,
+        unique_size,
+        consumed_size,
     })
 }
 

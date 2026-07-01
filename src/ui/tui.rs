@@ -136,6 +136,7 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot) {
             "here" => Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             "repo" => Style::default().fg(Color::Magenta),
             "file" => Style::default().fg(Color::Gray),
+            "report" => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             _ => Style::default(),
         };
         let sel_marker = if i == snap.selected { "▶ " } else { "  " };

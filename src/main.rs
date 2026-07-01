@@ -133,6 +133,23 @@ fn main() -> Result<()> {
         let repos = annex::find_annex_repos(&scan_root);
         println!("git-annex-browser dump for {}", scan_root.display());
         println!("found {} annex repos\n", repos.len());
+
+        // Global report
+        let mut total_unique = 0u64;
+        let mut total_consumed = 0u64;
+        let mut total_files = 0usize;
+        for r in &repos {
+            if let Ok(m) = annex::load_metadata(r) {
+                total_unique += m.unique_size;
+                total_consumed += m.consumed_size;
+                total_files += m.files.len();
+            }
+        }
+        println!("REPORT:");
+        println!("  total unique data (1 copy per file): {}", util::human_bytes(total_unique));
+        println!("  total storage across all drives (with copies): {}", util::human_bytes(total_consumed));
+        println!("  total working tree files: {}\n", total_files);
+
         for r in &repos {
             match annex::load_metadata(r) {
                 Ok(m) => {
@@ -142,6 +159,8 @@ fn main() -> Result<()> {
                     println!("  path: {}", r.display());
                     println!("  uuid: {}", m.uuid);
                     println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
+                    println!("  unique size (1 copy): {}", util::human_bytes(m.unique_size));
+                    println!("  consumed across drives: {}", util::human_bytes(m.consumed_size));
                     println!("  remotes/drives:");
                     let mut rems: Vec<_> = m.remotes.values().collect();
                     // sort by last fsck (most recent first) then name

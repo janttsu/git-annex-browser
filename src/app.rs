@@ -99,7 +99,7 @@ impl App {
             raw,
             status: self.status.clone(),
             total_repos: if let Some(r) = self.stack.first() {
-                r.node.children().len()
+                r.node.children().iter().filter(|k| k.kind() != "report").count()
             } else { 0 },
         }
     }
@@ -209,6 +209,8 @@ impl App {
                     remote_count: 0,
                     here_present_count: 0,
                     here_available_space: None,
+                    unique_size: 0,
+                    consumed_size: 0,
                 };
                 s.ensure_name();
                 s
@@ -234,7 +236,8 @@ impl App {
     }
 
     /// Merge a freshly loaded full meta into preloaded + summaries.
-    pub fn ingest_meta(&mut self, meta: AnnexMetadata) {
+    pub fn ingest_meta(&mut self, mut meta: AnnexMetadata) {
+        meta.ensure_sizes();
         let sum = meta.to_summary();
         self.preloaded.insert(meta.root.clone(), meta);
         self.apply_summary(sum);
