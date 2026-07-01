@@ -7,8 +7,6 @@ A [Crossterm](https://github.com/crossterm-rs/crossterm) +
 
 **Binary name:** `git-annex-browser`
 
-Inspired by zfs-browser: takes a directory, discovers all git-annex repos underneath, and lets you browse drives (special remotes), trust levels, last fsck timestamps, file lists, and — most importantly — **which files live on which drives**.
-
 Pure data access via the git repo and git-annex plumbing / branch logs where possible.
 
 ## Features
@@ -74,10 +72,6 @@ Then run:
 ```sh
 git-annex-browser /path/with/annexes
 ```
-
-## Notes
-
-> **Note on rename**: The project was previously known as `annex-browser`. The binary and cache directory are now `git-annex-browser`. If you have an old cache at `~/.cache/annex-browser/`, you can safely delete it.
 
 ## Future Ideas
 - Works great for personal collections of annexes on multiple drives (the original use case).
