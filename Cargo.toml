@@ -2,7 +2,7 @@
 name = "git-annex-browser"
 version = "0.1.0"
 authors = ["janttsu"]
-description = "TUI browser for git-annex repositories, remotes, trust, locations and metadata"
+description = "TUI for git-annex repositories and drives. All the information is available via normal git-annex commands, but the tool caches it (via --scan) so you can quickly browse the overall state of many (often offline) drives through a fast, clear interface instead of repeatedly running slow queries."
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 edition = "2024"
