@@ -64,14 +64,6 @@ impl App {
         }
     }
 
-    pub fn current(&self) -> &Rc<dyn Node> {
-        &self.stack.last().unwrap().node
-    }
-
-    pub fn selected_idx(&self) -> usize {
-        self.stack.last().map(|l| l.selected).unwrap_or(0)
-    }
-
     fn current_level_mut(&mut self) -> &mut Level {
         self.stack.last_mut().unwrap()
     }
@@ -252,7 +244,7 @@ impl App {
     /// Recompute drive name -> profile map from all preloaded metas.
     /// Used to highlight drives that differ (trust, groups, wanted, required) from the common setup.
     pub fn recompute_drive_profiles(&mut self) {
-        use crate::annex::{DriveProfile, TrustLevel};
+        use crate::annex::DriveProfile;
         let mut profiles: HashMap<String, DriveProfile> = HashMap::new();
         for meta in self.preloaded.values() {
             for r in meta.remotes.values() {
@@ -267,48 +259,6 @@ impl App {
             }
         }
         self.drive_profiles = profiles;
-    }
-
-    /// Returns true if this drive's setup (trust/groups/wanted/required) differs from the common one for that name.
-    pub fn drive_is_anomalous(&self, name: &str, remote: &crate::annex::Remote) -> bool {
-        let p = match self.drive_profiles.get(name) {
-            Some(p) => p,
-            None => return false,
-        };
-        if p.has_variation() {
-            // Check if this one matches the most common for each dimension
-            if let Some(common_t) = p.most_common_trust() {
-                if remote.trust != common_t {
-                    return true;
-                }
-            }
-            if let Some(common_g) = p.most_common_groups() {
-                let mut my_g = remote.groups.clone();
-                my_g.sort();
-                if my_g != common_g {
-                    return true;
-                }
-            }
-            if let Some(common_w) = p.most_common_wanted() {
-                if remote.wanted.as_ref() != Some(&common_w) && remote.wanted.is_some() {
-                    // if this has a wanted but common doesn't, or different
-                    if remote.wanted != p.most_common_wanted().map(Some).unwrap_or(None) {
-                        return true;
-                    }
-                }
-            }
-            // similar for required
-            if let Some(common_r) = p.most_common_required() {
-                if remote.required.as_ref() != Some(&common_r) {
-                    if remote.required != p.most_common_required().map(Some).unwrap_or(None) {
-                        return true;
-                    }
-                }
-            }
-        }
-        // Also consider if this name appears in many repos but not configured here? 
-        // For now, if the drive is listed here but the profile shows variation in other attrs.
-        false
     }
 
     /// Rebuild/replace the root level node using the current summaries (no downcast).

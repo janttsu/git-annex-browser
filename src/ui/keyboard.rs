@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::Command;
 
 pub fn map_key(key: KeyEvent) -> Command {

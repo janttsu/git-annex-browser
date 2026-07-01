@@ -5,8 +5,7 @@ Similar structure to zfs-browser: everything is a Node.
 */
 
 use crate::annex::{parse_size_from_key, AnnexMetadata, AnnexedFile, Remote, TrustLevel};
-use crate::util::{fmt_unix, human_bytes, short_uuid, trust_color};
-use ratatui::style::{Color, Style};
+use crate::util::{fmt_unix, human_bytes, short_uuid};
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -16,7 +15,6 @@ use std::rc::Rc;
 pub trait Node {
     fn label(&self) -> String;
     fn kind(&self) -> &'static str;
-    fn is_leaf(&self) -> bool { false }
     fn children(&self) -> Vec<Rc<dyn Node>> { vec![] }
     fn details(&self) -> Vec<String> { vec![] }
     /// Optional raw text for "x" key (e.g. full log)
@@ -68,7 +66,6 @@ pub struct RepoLoadingNode {
 impl Node for RepoLoadingNode {
     fn label(&self) -> String { format!("{} (loading...)", self.path.display()) }
     fn kind(&self) -> &'static str { "repo" }
-    fn is_leaf(&self) -> bool { true }
     fn details(&self) -> Vec<String> {
         vec!["Loading git-annex metadata in background...".into()]
     }
@@ -159,7 +156,7 @@ impl Node for RepoNode {
             kids.push(Rc::new(AllFilesNode { meta: self.meta.clone(), cached_children: std::cell::RefCell::new(None) }));
         }
         // Quick link to files present locally
-        if let Some(here) = self.meta.remotes.get(&self.meta.uuid) {
+        if self.meta.remotes.contains_key(&self.meta.uuid) {
             kids.push(Rc::new(FilesOnDriveNode {
                 meta: self.meta.clone(),
                 drive_uuid: self.meta.uuid.clone(),
@@ -193,7 +190,6 @@ pub struct RepoInfoNode {
 impl Node for RepoInfoNode {
     fn label(&self) -> String { "info / summary".into() }
     fn kind(&self) -> &'static str { "info" }
-    fn is_leaf(&self) -> bool { true }
     fn details(&self) -> Vec<String> {
         let m = &self.meta;
         let clean = m.root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| m.description.clone());
@@ -407,7 +403,6 @@ pub struct DriveInfoNode {
 impl Node for DriveInfoNode {
     fn label(&self) -> String { "drive info".into() }
     fn kind(&self) -> &'static str { "info" }
-    fn is_leaf(&self) -> bool { true }
     fn details(&self) -> Vec<String> {
         let r = &self.remote;
         let mut rows = vec![
@@ -500,7 +495,7 @@ impl Node for FilesOnDriveNode {
         let mut drive_files: Vec<AnnexedFile> = vec![];
         // Batch lookup keys for the paths present on this drive
         if !annexed_paths.is_empty() {
-            let mut child = Command::new("git")
+            let child = Command::new("git")
                 .arg("-C").arg(&self.meta.root)
                 .arg("annex").arg("lookupkey").arg("--batch")
                 .stdin(Stdio::piped())
@@ -613,7 +608,6 @@ impl Node for AnnexFileNode {
         format!("{}{}", base, badge)
     }
     fn kind(&self) -> &'static str { "file" }
-    fn is_leaf(&self) -> bool { true }
     fn details(&self) -> Vec<String> {
         let mut d = vec![
             format!("path: {}", self.file.path),
