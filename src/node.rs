@@ -45,15 +45,53 @@ impl Node for RootNode {
     }
     fn kind(&self) -> &'static str { "root" }
     fn children(&self) -> Vec<Rc<dyn Node>> {
-        self.summaries.iter().map(|s| {
+        let mut kids: Vec<Rc<dyn Node>> = vec![
+            Rc::new(GlobalReportNode { summaries: self.summaries.clone() }) as Rc<dyn Node>,
+        ];
+        kids.extend(self.summaries.iter().map(|s| {
             Rc::new(RepoSummaryNode { summary: s.clone() }) as Rc<dyn Node>
-        }).collect()
+        }));
+        kids
     }
     fn details(&self) -> Vec<String> {
         vec![
             format!("root: {}", self.scan_root.display()),
             format!("annex repos found: {}", self.summaries.len()),
-            "Drives sorted by last fsck time. Use --scan to refresh cache.".to_string(),
+            "The first item in the list is '📊 Global report (all repos)' — select it for totals across everything.".into(),
+            "Use --scan to refresh cache.".into(),
+        ]
+    }
+}
+
+/// Global info/summary node shown first at root level.
+/// Shows aggregates across ALL scanned repos.
+pub struct GlobalReportNode {
+    pub summaries: Vec<crate::annex::RepoSummary>,
+}
+
+impl Node for GlobalReportNode {
+    fn label(&self) -> String {
+        "📊 Global report (all repos)".into()
+    }
+    fn kind(&self) -> &'static str { "report" }
+    fn children(&self) -> Vec<Rc<dyn Node>> { vec![] }
+    fn details(&self) -> Vec<String> {
+        let num_repos = self.summaries.len();
+        let total_files: usize = self.summaries.iter().map(|s| s.file_count).sum();
+        let total_remotes: usize = self.summaries.iter().map(|s| s.remote_count).sum();
+        let total_here: usize = self.summaries.iter().map(|s| s.here_present_count).sum();
+        let total_unique: u64 = self.summaries.iter().map(|s| s.unique_size).sum();
+        let total_consumed: u64 = self.summaries.iter().map(|s| s.consumed_size).sum();
+
+        vec![
+            "GLOBAL REPORT — totals across ALL repos".into(),
+            format!("Repos: {}", num_repos),
+            format!("Working tree files: {}", total_files),
+            format!("Remotes/drives: {}", total_remotes),
+            format!("Keys present here (across repos): {}", total_here),
+            format!("Unique data size (1 copy each): {}", human_bytes(total_unique)),
+            format!("Total storage used across drives (with copies): {}", human_bytes(total_consumed)),
+            "Select a repo below to browse its drives/files.".into(),
         ]
     }
 }
@@ -110,6 +148,8 @@ impl Node for RepoSummaryNode {
         d.push(format!("files in working tree: {}", s.file_count));
         d.push(format!("known remotes/drives: {}", s.remote_count));
         d.push(format!("keys present here: {}", s.here_present_count));
+        d.push(format!("unique data size (1 copy): {}", human_bytes(s.unique_size)));
+        d.push(format!("consumed across drives: {}", human_bytes(s.consumed_size)));
         d.push("→ descend to see drives (sorted by last fsck), groups, wanted, numcopies etc.".to_string());
         d
     }
@@ -174,6 +214,8 @@ impl Node for RepoNode {
             format!("description: {}", m.description),
             format!("annexed files (working tree): {}", m.files.len()),
             format!("known keys (locations): {}", m.total_keys),
+            format!("unique data size (1 copy): {}", human_bytes(m.unique_size)),
+            format!("consumed across all drives (with copies): {}", human_bytes(m.consumed_size)),
             format!("known remotes/drives: {}", m.remotes.len()),
         ];
         if let Some(h) = m.remotes.get(&m.uuid) {

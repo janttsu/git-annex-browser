@@ -35,8 +35,9 @@ pub fn spawn(
 
         // 1. Try cache first for instant UI
         if let Some(cache) = annex::load_cache() {
-            for (pstr, meta) in cache.repos {
+            for (pstr, mut meta) in cache.repos {
                 let p = PathBuf::from(pstr);
+                meta.ensure_sizes();
                 worker.app.preloaded.insert(p.clone(), meta.clone());
                 let mut sum = meta.to_summary();
                 sum.ensure_name();
@@ -62,6 +63,8 @@ pub fn spawn(
                     remote_count: 0,
                     here_present_count: 0,
                     here_available_space: None,
+                    unique_size: 0,
+                    consumed_size: 0,
                 };
                 sum.ensure_name();
                 worker.app.summaries.push(sum);
@@ -96,7 +99,8 @@ pub fn spawn(
             // Drain any completed metadata loads (from background threads). This keeps the worker responsive.
             while let Ok((p, res)) = meta_rx.try_recv() {
                 match res {
-                    Ok(meta) => {
+                    Ok(mut meta) => {
+                        meta.ensure_sizes();
                         let mut sum = meta.to_summary();
                         sum.ensure_name();
                         worker.app.preloaded.insert(p.clone(), meta.clone());
