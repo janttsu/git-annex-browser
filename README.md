@@ -2,6 +2,10 @@
 
 [![License: MIT/Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 
+![Main view](assets/main-view.png)
+
+![Drives view](assets/drives-view.png)
+
 A [Crossterm](https://github.com/crossterm-rs/crossterm) +
 [Ratatui](https://ratatui.rs) terminal UI for exploring git-annex repositories.
 
