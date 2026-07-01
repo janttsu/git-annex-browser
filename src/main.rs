@@ -140,10 +140,10 @@ fn main() -> Result<()> {
                     println!("  path: {}", r.display());
                     println!("  uuid: {}", m.uuid);
                     println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
-                    println!("  remotes/drives (sorted by free space):");
+                    println!("  remotes/drives:");
                     let mut rems: Vec<_> = m.remotes.values().collect();
-                    // demo the new default sort: most free first
-                    rems.sort_by_key(|r| std::cmp::Reverse(r.available_space.unwrap_or(0)));
+                    // sort by last fsck (most recent first) then name
+                    rems.sort_by_key(|r| (std::cmp::Reverse(r.last_fsck.unwrap_or(0)), r.name().to_string()));
                     for rem in rems {
                         let marker = if rem.uuid == m.uuid { " [HERE]" } else { "" };
                         let fs = rem.last_fsck.map(|t| format!(" fsck={}", util::fmt_unix(t))).unwrap_or_default();

@@ -47,7 +47,7 @@ pub struct App {
     pub summaries: Vec<RepoSummary>,
     /// Paths we still want to (re)hydrate from disk in the background
     pub to_hydrate: Vec<PathBuf>,
-    /// Profiles of drives by their name (e.g. "hdd-sata-01") across all repos, for anomaly detection.
+    /// Profiles of drives by their name (e.g. "remote-foo") across all repos, for anomaly detection.
     pub drive_profiles: HashMap<String, annex::DriveProfile>,
 }
 

@@ -666,7 +666,7 @@ impl Node for AnnexFileNode {
 /// Represents a directory in the annexed files tree.
 pub struct DirectoryNode {
     meta: AnnexMetadata,
-    dir_path: String, // e.g. "photos/2023" or "" for top
+    dir_path: String, // e.g. "subdir/example" or "" for top
     // If set, only include files present on this drive (for per-drive tree views)
     drive_uuid: Option<String>,
     cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,

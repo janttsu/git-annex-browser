@@ -116,7 +116,7 @@ pub struct AnnexMetadata {
 pub struct RepoSummary {
     pub root: PathBuf,
     pub uuid: String,
-    /// Clean name for display, preferably the directory basename (e.g. "archive-photos-annex")
+    /// Clean name for display, preferably the directory basename (e.g. "my-repo")
     #[serde(default)]
     pub name: String,
     /// The annex internal description (often "orca" or similar on your machines)
@@ -830,10 +830,10 @@ mod tests {
     use super::*;
     #[test]
     fn test_find_and_load_demo() {
-        // recreate minimal if needed? but assume /tmp/annex-demo2 exists from previous
-        let p = std::path::Path::new("/tmp/annex-demo2");
+        // This test looks for a demo annex at /tmp/annex-demo for manual testing.
+        // It is skipped if the demo repo is not present.
+        let p = std::path::Path::new("/tmp/annex-demo");
         if !is_annex_repo(p) {
-            // skip or recreate? for CI just assert true when present
             eprintln!("demo not present, skipping load test");
             return;
         }
