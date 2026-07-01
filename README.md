@@ -9,6 +9,8 @@
 A [Crossterm](https://github.com/crossterm-rs/crossterm) +
 [Ratatui](https://ratatui.rs) terminal UI for exploring git-annex repositories.
 
+All this information is available via normal `git annex` commands, but querying it repeatedly across many repositories and drives (especially when many of them are offline) is slow and cumbersome. The tool caches the data (using `--scan`) so you can explore the complete current state quickly and clearly through an interactive interface.
+
 **Binary name:** `git-annex-browser`
 
 Pure data access via the git repo and git-annex plumbing / branch logs where possible.
@@ -22,6 +24,7 @@ Pure data access via the git repo and git-annex plumbing / branch logs where pos
   - All annexed files in the working tree, each annotated with short presence badges
 - For each file: full list of locations (which UUIDs / names currently have the content) + key + size
 - Location data comes from authoritative `git annex whereis --json --all` + git-annex branch logs
+- `--scan` caches the data so that browsing the overall state of many (often offline) drives is fast and convenient in the UI.
 - Keyboard-driven tree navigation like zfs-browser
 
 ## Usage
@@ -34,6 +37,7 @@ git-annex-browser [DIR]
 - `DIR` defaults to `.` (current directory)
 - Descend into a repo → drives → see files on that drive
 - `r` to re-scan from disk
+- `--scan` to cache the current state so you can browse it quickly and clearly in the UI (useful for cron)
 
 Keys (similar to zfs-browser):
 ```

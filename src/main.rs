@@ -20,7 +20,7 @@ use ui::{keyboard::map_key, tui};
 use worker::WorkerMsg;
 
 #[derive(Parser)]
-#[command(version, about = "TUI browser for git-annex metadata: repos, remotes/drives, trust, fsck, file locations")]
+#[command(version, about = "TUI for git-annex repos & drives. Caches data so you can quickly browse the state of many (often offline) drives via a clear interface.")]
 struct Config {
     /// Directory to recursively scan for git-annex repositories
     #[arg(default_value = ".")]
@@ -34,12 +34,14 @@ struct Config {
     #[arg(long)]
     dump: bool,
 
-    /// Scan all repos under the directory and update the cache (no TUI/GUI).
-    /// Intended for periodic/cron use.
+    /// Scan repos and update the local cache (no TUI/GUI).
+    /// The tool's main value is caching git-annex metadata so that viewing
+    /// the overall state of many repositories and drives is fast and clear
+    /// in the interactive interface, instead of running slow commands repeatedly.
     #[arg(long)]
     scan: bool,
 
-    /// Suppress progress and summary output (useful with --scan for cron).
+    /// Suppress progress and summary output (useful with --scan for cron jobs).
     #[arg(long)]
     quiet: bool,
 }
