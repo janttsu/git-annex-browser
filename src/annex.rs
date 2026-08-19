@@ -3,7 +3,6 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -32,10 +31,6 @@ impl TrustLevel {
         }
     }
 
-    pub fn from_char(c: char) -> Self {
-        let mut buf = [0u8; 4];
-        Self::from_token(c.encode_utf8(&mut buf))
-    }
     pub fn as_str(&self) -> &'static str {
         match self {
             TrustLevel::Trusted => "trusted",
@@ -189,11 +184,10 @@ impl AnnexMetadata {
                 }
             }
             for key in self.locations.keys() {
-                if !key_sizes.contains_key(key) {
-                    if let Some(sz) = parse_size_from_key(key) {
+                if !key_sizes.contains_key(key)
+                    && let Some(sz) = parse_size_from_key(key) {
                         key_sizes.insert(key.clone(), sz);
                     }
-                }
             }
             let mut u = 0u64;
             let mut c = 0u64;
@@ -533,11 +527,10 @@ pub fn parse_size_from_key(key: &str) -> Option<u64> {
     // Standard key: BACKEND[-sSIZE][-mMTIME][-S..]--HASH
     let prefix = key.split_once("--").map(|(p, _)| p).unwrap_or(key);
     for field in prefix.split('-').skip(1) {
-        if let Some(rest) = field.strip_prefix('s') {
-            if let Ok(n) = rest.parse::<u64>() {
+        if let Some(rest) = field.strip_prefix('s')
+            && let Ok(n) = rest.parse::<u64>() {
                 return Some(n);
             }
-        }
     }
     None
 }
@@ -583,11 +576,10 @@ fn parse_whereis_json_lines(stdout: &str) -> HashMap<String, HashSet<String>> {
         if line.is_empty() {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<WhereisJson>(line) {
-            if let Some(key) = val.key.clone() {
+        if let Ok(val) = serde_json::from_str::<WhereisJson>(line)
+            && let Some(key) = val.key.clone() {
                 locations.insert(key, val.uuids());
             }
-        }
     }
     locations
 }
@@ -755,8 +747,8 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     }
     // Parse top-level .gitattributes for annex.* settings (numcopies per path etc.)
     let ga_path = root.join(".gitattributes");
-    if ga_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&ga_path) {
+    if ga_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&ga_path) {
             for line in content.lines() {
                 let l = line.trim();
                 if l.contains("annex.numcopies") || l.contains("annex.") {
@@ -764,7 +756,6 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
                 }
             }
         }
-    }
     // Also pull other annex.* config for visibility
     if let Ok(cfg_list) = run_git(&root, &["config", "--get-regexp", "^annex\\."]) {
         for line in cfg_list.lines() {
@@ -826,13 +817,12 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         let stdout = child.stdout.take().unwrap();
         let reader = BufReader::new(stdout);
         for (i, line_res) in reader.lines().enumerate() {
-            if let Ok(key) = line_res {
-                if i < annexed_paths.len() {
+            if let Ok(key) = line_res
+                && i < annexed_paths.len() {
                     let path = annexed_paths[i].clone();
                     let size = parse_size_from_key(&key);
                     files.push(AnnexedFile { path, key, size });
                 }
-            }
         }
         let _ = child.wait();
     }
@@ -854,7 +844,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
 
     // Compute present counts
     let mut present_counts: HashMap<String, usize> = HashMap::new();
-    for (_k, us) in &locations {
+    for us in locations.values() {
         for u in us {
             *present_counts.entry(u.clone()).or_default() += 1;
         }
@@ -873,11 +863,10 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         }
     }
     for key in locations.keys() {
-        if !key_sizes.contains_key(key) {
-            if let Some(sz) = parse_size_from_key(key) {
+        if !key_sizes.contains_key(key)
+            && let Some(sz) = parse_size_from_key(key) {
                 key_sizes.insert(key.clone(), sz);
             }
-        }
     }
 
     // Compute storage report
@@ -952,15 +941,15 @@ fn remote_drive_path(rem: &Remote, repo_root: &Path, here_uuid: &str) -> Option<
 /// Fill available_space for drives that map to local directories.
 fn fill_drive_spaces(repo_root: &Path, here_uuid: &str, remotes: &mut HashMap<String, Remote>) {
     for r in remotes.values_mut() {
-        if let Some(p) = remote_drive_path(r, repo_root, here_uuid) {
-            if let Some((avail, _total)) = get_fs_space(&p) {
+        if let Some(p) = remote_drive_path(r, repo_root, here_uuid)
+            && let Some((avail, _total)) = get_fs_space(&p) {
                 r.available_space = Some(avail);
             }
-        }
     }
 }
 
 /// Query filesystem available and total bytes for a path using statvfs (Linux).
+#[cfg(unix)]
 pub fn get_fs_space(path: &Path) -> Option<(u64, u64)> {
     use libc::statvfs;
     use std::ffi::CString;
@@ -975,6 +964,11 @@ pub fn get_fs_space(path: &Path) -> Option<(u64, u64)> {
     } else {
         None
     }
+}
+
+#[cfg(not(unix))]
+pub fn get_fs_space(_path: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 // ---------------------- Cache (local DB file) ----------------------
@@ -1042,21 +1036,19 @@ pub fn path_is_under(path: &Path, root: &Path) -> bool {
 }
 
 pub fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
-        if !xdg.is_empty() {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
+        && !xdg.is_empty() {
             return PathBuf::from(xdg).join("git-annex-browser");
         }
-    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".cache").join("git-annex-browser")
 }
 
 pub fn cache_path() -> PathBuf {
-    if let Ok(p) = std::env::var("GIT_ANNEX_BROWSER_CACHE") {
-        if !p.is_empty() {
+    if let Ok(p) = std::env::var("GIT_ANNEX_BROWSER_CACHE")
+        && !p.is_empty() {
             return PathBuf::from(p);
         }
-    }
     cache_dir().join("cache.json")
 }
 
@@ -1072,6 +1064,7 @@ fn lock_cache() -> Result<CacheLock> {
     std::fs::create_dir_all(&dir)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(dir.join("cache.lock"))?;
@@ -1200,7 +1193,7 @@ mod tests {
         assert_eq!(TrustLevel::from_token("?"), TrustLevel::SemiTrusted);
         assert_eq!(TrustLevel::from_token("X"), TrustLevel::Dead);
         assert_eq!(TrustLevel::from_token("trusted"), TrustLevel::Trusted);
-        assert_eq!(TrustLevel::from_char('1'), TrustLevel::Trusted);
+        assert_eq!(TrustLevel::from_token("T"), TrustLevel::Trusted);
     }
 
     #[test]

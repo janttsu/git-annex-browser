@@ -1,5 +1,5 @@
-use crossterm::event::{KeyCode, KeyEvent};
 use crate::app::Command;
+use crossterm::event::{KeyCode, KeyEvent};
 
 pub fn map_key(key: KeyEvent) -> Command {
     match key.code {
