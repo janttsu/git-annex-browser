@@ -4,8 +4,8 @@ use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 mod annex;
@@ -20,7 +20,10 @@ use ui::{keyboard::map_key, tui};
 use worker::WorkerMsg;
 
 #[derive(Parser)]
-#[command(version, about = "TUI for git-annex repos & drives. Caches data so you can quickly browse the state of many (often offline) drives via a clear interface.")]
+#[command(
+    version,
+    about = "TUI for git-annex repos & drives. Caches data so you can quickly browse the state of many (often offline) drives via a clear interface."
+)]
 struct Config {
     /// Directory to recursively scan for git-annex repositories
     #[arg(default_value = ".")]
@@ -50,7 +53,10 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
     let quiet = cfg.quiet;
 
     if !quiet {
-        eprintln!("Scanning for git-annex repos under {} ...", scan_root.display());
+        eprintln!(
+            "Scanning for git-annex repos under {} ...",
+            scan_root.display()
+        );
     }
 
     let repos = annex::find_annex_repos(scan_root);
@@ -59,14 +65,7 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
         eprintln!("Found {} repos", repos.len());
     }
 
-    let mut cache = annex::AnnexCache {
-        version: 1,
-        updated: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64,
-        repos: std::collections::HashMap::new(),
-    };
+    let mut found = std::collections::HashMap::new();
 
     let total = repos.len();
     for (i, r) in repos.iter().enumerate() {
@@ -78,7 +77,7 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| r.display().to_string());
             if name.len() > 40 {
-                name = format!("...{}", &name[name.len()-37..]);
+                name = format!("...{}", &name[name.len() - 37..]);
             }
             let pct = if total == 0 { 100 } else { (idx * 100) / total };
             let bar_width = 30;
@@ -90,7 +89,7 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
 
         match annex::load_metadata(r) {
             Ok(m) => {
-                cache.repos.insert(r.to_string_lossy().to_string(), m);
+                found.insert(r.to_string_lossy().to_string(), m);
             }
             Err(e) => {
                 if !quiet {
@@ -104,7 +103,7 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
         eprintln!(); // finish the progress line
     }
 
-    if let Err(e) = annex::save_cache(&cache) {
+    if let Err(e) = annex::merge_scan_into_cache(scan_root, found) {
         if !quiet {
             eprintln!("Failed to save cache: {}", e);
         }
@@ -122,7 +121,9 @@ fn run_scan(cfg: &Config, scan_root: &PathBuf) -> Result<()> {
 
 fn main() -> Result<()> {
     let cfg = Config::parse();
-    let scan_root: PathBuf = PathBuf::from(&cfg.dir).canonicalize().unwrap_or_else(|_| PathBuf::from(&cfg.dir));
+    let scan_root: PathBuf = PathBuf::from(&cfg.dir)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&cfg.dir));
 
     if cfg.scan {
         return run_scan(&cfg, &scan_root);
@@ -134,62 +135,87 @@ fn main() -> Result<()> {
         println!("git-annex-browser dump for {}", scan_root.display());
         println!("found {} annex repos\n", repos.len());
 
-        // Global report
-        let mut total_unique = 0u64;
-        let mut total_consumed = 0u64;
-        let mut total_files = 0usize;
-        for r in &repos {
-            if let Ok(m) = annex::load_metadata(r) {
-                total_unique += m.unique_size;
-                total_consumed += m.consumed_size;
-                total_files += m.files.len();
-            }
-        }
-        println!("REPORT:");
-        println!("  total unique data (1 copy per file): {}", util::human_bytes(total_unique));
-        println!("  total storage across all drives (with copies): {}", util::human_bytes(total_consumed));
-        println!("  total working tree files: {}\n", total_files);
-
+        let mut loaded: Vec<(PathBuf, annex::AnnexMetadata)> = Vec::new();
         for r in &repos {
             match annex::load_metadata(r) {
-                Ok(m) => {
-                    let clean = r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| r.display().to_string());
-                    let desc_note = if !m.description.is_empty() && m.description != clean { format!(" ({})", m.description) } else { String::new() };
-                    println!("=== {}{} ===", clean, desc_note);
-                    println!("  path: {}", r.display());
-                    println!("  uuid: {}", m.uuid);
-                    println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
-                    println!("  unique size (1 copy): {}", util::human_bytes(m.unique_size));
-                    println!("  consumed across drives: {}", util::human_bytes(m.consumed_size));
-                    println!("  remotes/drives:");
-                    let mut rems: Vec<_> = m.remotes.values().collect();
-                    // sort by last fsck (most recent first) then name
-                    rems.sort_by_key(|r| (std::cmp::Reverse(r.last_fsck.unwrap_or(0)), r.name().to_string()));
-                    for rem in rems {
-                        let marker = if rem.uuid == m.uuid { " [HERE]" } else { "" };
-                        let fs = rem.last_fsck.map(|t| format!(" fsck={}", util::fmt_unix(t))).unwrap_or_default();
-                        let sp = rem.available_space.map(|b| format!(" {} free", util::human_bytes(b))).unwrap_or_default();
-                        println!("    - {} ({}){} trust={} present={} keys{}{}", rem.name(), rem.rtype(), marker, rem.trust.as_str(), rem.present_count, fs, sp);
-                    }
-                    println!();
-                }
+                Ok(m) => loaded.push((r.clone(), m)),
                 Err(e) => eprintln!("  load {} failed: {}", r.display(), e),
             }
         }
-        // Also persist a cache snapshot from this dump (fresh data)
-        let mut cache_repos = std::collections::HashMap::new();
-        for r in &repos {
-            if let Ok(m) = annex::load_metadata(r) {
-                cache_repos.insert(r.to_string_lossy().to_string(), m);
-            }
-        }
-        if !cache_repos.is_empty() {
-            let c = annex::AnnexCache {
-                version: 1,
-                updated: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                repos: cache_repos,
+
+        let total_unique: u64 = loaded.iter().map(|(_, m)| m.unique_size).sum();
+        let total_consumed: u64 = loaded.iter().map(|(_, m)| m.consumed_size).sum();
+        let total_files: usize = loaded.iter().map(|(_, m)| m.files.len()).sum();
+        println!("REPORT:");
+        println!(
+            "  total unique data (1 copy per file): {}",
+            util::human_bytes(total_unique)
+        );
+        println!(
+            "  total storage across all drives (with copies): {}",
+            util::human_bytes(total_consumed)
+        );
+        println!("  total working tree files: {}\n", total_files);
+
+        for (r, m) in &loaded {
+            let clean = r
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| r.display().to_string());
+            let desc_note = if !m.description.is_empty() && m.description != clean {
+                format!(" ({})", m.description)
+            } else {
+                String::new()
             };
-            let _ = annex::save_cache(&c);
+            println!("=== {}{} ===", clean, desc_note);
+            println!("  path: {}", r.display());
+            println!("  uuid: {}", m.uuid);
+            println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
+            println!(
+                "  unique size (1 copy): {}",
+                util::human_bytes(m.unique_size)
+            );
+            println!(
+                "  consumed across drives: {}",
+                util::human_bytes(m.consumed_size)
+            );
+            println!("  remotes/drives:");
+            let mut rems: Vec<_> = m.remotes.values().collect();
+            rems.sort_by_key(|r| {
+                (
+                    std::cmp::Reverse(r.last_fsck.unwrap_or(0)),
+                    r.name().to_string(),
+                )
+            });
+            for rem in rems {
+                let marker = if rem.uuid == m.uuid { " [HERE]" } else { "" };
+                let fs = rem
+                    .last_fsck
+                    .map(|t| format!(" fsck={}", util::fmt_unix(t)))
+                    .unwrap_or_default();
+                let sp = rem
+                    .available_space
+                    .map(|b| format!(" {} free", util::human_bytes(b)))
+                    .unwrap_or_default();
+                println!(
+                    "    - {} ({}){} trust={} present={} keys{}{}",
+                    rem.name(),
+                    rem.rtype(),
+                    marker,
+                    rem.trust.as_str(),
+                    rem.present_count,
+                    fs,
+                    sp
+                );
+            }
+            println!();
+        }
+        if !loaded.is_empty() {
+            let cache_repos = loaded
+                .into_iter()
+                .map(|(r, m)| (r.to_string_lossy().to_string(), m))
+                .collect();
+            let _ = annex::merge_scan_into_cache(&scan_root, cache_repos);
         }
         return Ok(());
     }
@@ -214,17 +240,30 @@ fn main() -> Result<()> {
         }
 
         guard.term.draw(|frame| {
-            tui::draw(frame, snapshot.as_ref(), pending > 0, show_help, show_raw, detail_scroll)
+            tui::draw(
+                frame,
+                snapshot.as_ref(),
+                pending > 0,
+                show_help,
+                show_raw,
+                detail_scroll,
+            )
         })?;
 
-        if !event::poll(tick)? { continue; }
-        let Event::Key(key) = event::read()? else { continue; };
+        if !event::poll(tick)? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
 
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             break;
         }
 
-        if key.kind != KeyEventKind::Press { continue; }
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
 
         if key.code == KeyCode::Char('x') && !show_help {
             show_raw = !show_raw;
@@ -249,11 +288,17 @@ fn main() -> Result<()> {
             Command::Quit => break,
             Command::ToggleHelp => show_help = !show_help,
             Command::None => (),
-            _ if show_help => { show_help = false; }
+            _ if show_help => {
+                show_help = false;
+            }
             // Handle pure navigation locally for instant UI response.
             // Worker will receive the command for authoritative state.
-            Command::Up | Command::Down | Command::PageUp | Command::PageDown |
-            Command::Top | Command::Bottom => {
+            Command::Up
+            | Command::Down
+            | Command::PageUp
+            | Command::PageDown
+            | Command::Top
+            | Command::Bottom => {
                 if let Some(s) = &mut snapshot {
                     let len = s.list.len().saturating_sub(1);
                     let page_size = tui::page_size(&guard.term).max(1);

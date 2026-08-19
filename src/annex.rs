@@ -1028,30 +1028,150 @@ impl DriveProfile {
     }
 }
 
-pub fn cache_path() -> PathBuf {
+pub const CACHE_VERSION: u32 = 1;
+
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+pub fn path_is_under(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
+}
+
+pub fn cache_dir() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("git-annex-browser");
+        }
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".cache")
-        .join("git-annex-browser")
-        .join("cache.json")
+    PathBuf::from(home).join(".cache").join("git-annex-browser")
+}
+
+pub fn cache_path() -> PathBuf {
+    if let Ok(p) = std::env::var("GIT_ANNEX_BROWSER_CACHE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    cache_dir().join("cache.json")
+}
+
+struct CacheLock {
+    _file: std::fs::File,
+}
+
+fn lock_cache() -> Result<CacheLock> {
+    let dir = cache_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(cache_dir);
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(dir.join("cache.lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            anyhow::bail!("could not lock cache");
+        }
+    }
+    Ok(CacheLock { _file: file })
+}
+
+fn redact_meta(mut meta: AnnexMetadata) -> AnnexMetadata {
+    for r in meta.remotes.values_mut() {
+        for (k, v) in r.config.iter_mut() {
+            if is_secret_remote_key(k) {
+                *v = "[redacted]".to_string();
+            }
+        }
+    }
+    meta
+}
+
+/// Merge a scan of `scan_root` into an existing repo map.
+/// Repos under `scan_root` that were not found this time are dropped; others stay.
+pub fn merge_scan_repos(
+    mut existing: HashMap<String, AnnexMetadata>,
+    scan_root: &Path,
+    found: HashMap<String, AnnexMetadata>,
+) -> HashMap<String, AnnexMetadata> {
+    existing.retain(|p, _| {
+        let pb = Path::new(p);
+        !path_is_under(pb, scan_root) || found.contains_key(p)
+    });
+    for (k, v) in found {
+        existing.insert(k, redact_meta(v));
+    }
+    existing
 }
 
 pub fn load_cache() -> Option<AnnexCache> {
-    let p = cache_path();
-    let data = std::fs::read_to_string(&p).ok()?;
-    serde_json::from_str(&data).ok()
+    let data = std::fs::read(cache_path()).ok()?;
+    let cache: AnnexCache = serde_json::from_slice(&data).ok()?;
+    if cache.version != 0 && cache.version != CACHE_VERSION {
+        return None;
+    }
+    Some(cache)
 }
 
-pub fn save_cache(cache: &AnnexCache) -> Result<()> {
+fn write_cache_unlocked(cache: &AnnexCache) -> Result<()> {
     let p = cache_path();
     if let Some(parent) = p.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
     let tmp = p.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(cache)?;
-    std::fs::write(&tmp, json.as_bytes())?;
+    let json = serde_json::to_vec(cache)?;
+    std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &p)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
+}
+
+#[allow(dead_code)]
+pub fn save_cache(cache: &AnnexCache) -> Result<()> {
+    let _lock = lock_cache()?;
+    write_cache_unlocked(cache)
+}
+
+/// Replace cached entries under `scan_root` with `found`; keep everything else.
+pub fn merge_scan_into_cache(
+    scan_root: &Path,
+    found: HashMap<String, AnnexMetadata>,
+) -> Result<()> {
+    let _lock = lock_cache()?;
+    let existing = load_cache().unwrap_or_default().repos;
+    let repos = merge_scan_repos(existing, scan_root, found);
+    let cache = AnnexCache {
+        version: CACHE_VERSION,
+        updated: now_unix(),
+        repos,
+    };
+    write_cache_unlocked(&cache)
+}
+
+/// Insert or update the given repos without dropping others.
+pub fn upsert_cache_repos(repos: impl IntoIterator<Item = (String, AnnexMetadata)>) -> Result<()> {
+    let _lock = lock_cache()?;
+    let mut cache = load_cache().unwrap_or_default();
+    cache.version = CACHE_VERSION;
+    cache.updated = now_unix();
+    for (k, v) in repos {
+        cache.repos.insert(k, redact_meta(v));
+    }
+    write_cache_unlocked(&cache)
 }
 #[cfg(test)]
 mod tests {
@@ -1256,6 +1376,39 @@ u2 something else timestamp=9s
         let _ = std::fs::remove_dir_all(&root);
         assert!(ok);
         assert!(found.iter().any(|p| p.ends_with("tree")), "found {found:?}");
+    }
+
+    fn dummy_meta(root: &str) -> AnnexMetadata {
+        AnnexMetadata {
+            root: PathBuf::from(root),
+            uuid: "u".into(),
+            description: String::new(),
+            version: None,
+            numcopies: None,
+            additional_configs: vec![],
+            remotes: HashMap::new(),
+            locations: HashMap::new(),
+            files: vec![],
+            total_keys: 0,
+            unique_size: 0,
+            consumed_size: 0,
+        }
+    }
+
+    #[test]
+    fn merge_scan_keeps_repos_outside_root() {
+        let mut existing = HashMap::new();
+        existing.insert("/data/media/a".into(), dummy_meta("/data/media/a"));
+        existing.insert("/data/backup/b".into(), dummy_meta("/data/backup/b"));
+        existing.insert("/data/media/gone".into(), dummy_meta("/data/media/gone"));
+        let mut found = HashMap::new();
+        found.insert("/data/media/a".into(), dummy_meta("/data/media/a"));
+        found.insert("/data/media/c".into(), dummy_meta("/data/media/c"));
+        let merged = merge_scan_repos(existing, Path::new("/data/media"), found);
+        assert!(merged.contains_key("/data/media/a"));
+        assert!(merged.contains_key("/data/media/c"));
+        assert!(merged.contains_key("/data/backup/b"));
+        assert!(!merged.contains_key("/data/media/gone"));
     }
 
     #[test]

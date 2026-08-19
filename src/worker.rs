@@ -3,14 +3,17 @@ Worker thread pattern copied from zfs-browser: UI talks via mpsc, worker owns th
 Slow loads happen here.
 */
 
-use crate::app::{App, Command, ViewSnapshot};
 use crate::annex::{self, RepoSummary};
+use crate::app::{App, Command, ViewSnapshot};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub enum WorkerMsg {
     Nav(Command, usize /*page size*/),
@@ -31,19 +34,27 @@ pub fn spawn(
     thread::spawn(move || {
         // meta_rx moved into this worker thread for draining results
         let meta_rx = meta_rx;
-        let mut worker = Worker { app: App::new(scan_root.clone()) };
+        let mut worker = Worker {
+            app: App::new(scan_root.clone()),
+        };
 
-        // 1. Try cache first for instant UI
+        // 1. Try cache first for instant UI (only repos under this scan root).
         if let Some(cache) = annex::load_cache() {
             for (pstr, mut meta) in cache.repos {
-                let p = PathBuf::from(pstr);
+                let p = PathBuf::from(&pstr);
+                if !annex::path_is_under(&p, &scan_root) {
+                    continue;
+                }
                 meta.ensure_sizes();
                 worker.app.preloaded.insert(p.clone(), meta.clone());
                 let mut sum = meta.to_summary();
                 sum.ensure_name();
                 worker.app.summaries.push(sum);
             }
-            worker.app.status = format!("loaded {} from cache — scanning…", worker.app.preloaded.len());
+            worker.app.status = format!(
+                "loaded {} from cache — scanning…",
+                worker.app.preloaded.len()
+            );
             worker.app.recompute_drive_profiles();
         }
 
@@ -53,7 +64,11 @@ pub fn spawn(
         // Seed any missing summaries from discovery (for repos not in cache)
         for p in &discovered {
             if !worker.app.summaries.iter().any(|s| &s.root == p) {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let name = p
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 let mut sum = RepoSummary {
                     root: p.clone(),
                     uuid: String::new(),
@@ -78,7 +93,9 @@ pub fn spawn(
         // Only re-hydrate things not already in cache for faster startup.
         // Explicit refresh will re-scan.
         for p in &discovered {
-            if !worker.app.preloaded.contains_key(p) && !worker.app.to_hydrate.iter().any(|x| x == p) {
+            if !worker.app.preloaded.contains_key(p)
+                && !worker.app.to_hydrate.iter().any(|x| x == p)
+            {
                 worker.app.to_hydrate.push(p.clone());
             }
         }
@@ -104,7 +121,9 @@ pub fn spawn(
                         let mut sum = meta.to_summary();
                         sum.ensure_name();
                         worker.app.preloaded.insert(p.clone(), meta.clone());
-                        if let Some(existing) = worker.app.summaries.iter_mut().find(|s| s.root == p) {
+                        if let Some(existing) =
+                            worker.app.summaries.iter_mut().find(|s| s.root == p)
+                        {
                             *existing = sum;
                         } else {
                             worker.app.summaries.push(sum);
@@ -113,14 +132,7 @@ pub fn spawn(
                         dirty = true;
                         let _ = snap_tx.send(worker.app.snapshot(20));
                         if last_save.elapsed() > Duration::from_secs(4) {
-                            let cache = annex::AnnexCache {
-                                version: 1,
-                                updated: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                                repos: worker.app.preloaded.iter()
-                                    .map(|(k, v)| (k.to_string_lossy().to_string(), v.clone()))
-                                    .collect(),
-                            };
-                            let _ = annex::save_cache(&cache);
+                            persist_preloaded(&worker.app);
                             last_save = std::time::Instant::now();
                             dirty = false;
                         }
@@ -141,17 +153,11 @@ pub fn spawn(
                             let _ = meta_tx.send((p, res));
                         });
                     } else if dirty && last_save.elapsed() > Duration::from_secs(2) {
-                        let cache = annex::AnnexCache {
-                            version: 1,
-                            updated: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                            repos: worker.app.preloaded.iter()
-                                .map(|(k, v)| (k.to_string_lossy().to_string(), v.clone()))
-                                .collect(),
-                        };
-                        let _ = annex::save_cache(&cache);
+                        persist_preloaded(&worker.app);
                         last_save = std::time::Instant::now();
                         dirty = false;
-                        worker.app.status = format!("{} repos • cache updated", worker.app.preloaded.len());
+                        worker.app.status =
+                            format!("{} repos • cache updated", worker.app.preloaded.len());
                         let _ = snap_tx.send(worker.app.snapshot(20));
                     }
                     continue;
@@ -200,20 +206,19 @@ pub fn spawn(
             }
         }
 
-        // best effort final save on exit
         if !worker.app.preloaded.is_empty() {
-            let cache = annex::AnnexCache {
-                version: 1,
-                updated: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64,
-                repos: worker.app.preloaded.iter()
-                    .map(|(k, v)| (k.to_string_lossy().to_string(), v.clone()))
-                    .collect(),
-            };
-            let _ = annex::save_cache(&cache);
+            persist_preloaded(&worker.app);
         }
     });
 
     (cmd_tx, snap_rx)
 }
 
-
+fn persist_preloaded(app: &App) {
+    let repos = app
+        .preloaded
+        .iter()
+        .map(|(k, v)| (k.to_string_lossy().to_string(), v.clone()))
+        .collect::<Vec<_>>();
+    let _ = annex::upsert_cache_repos(repos);
+}
