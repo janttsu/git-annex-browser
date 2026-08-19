@@ -5,9 +5,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::io::{BufRead, BufReader, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,13 +19,22 @@ pub enum TrustLevel {
 }
 
 impl TrustLevel {
-    pub fn from_char(c: char) -> Self {
-        match c {
-            'T' | 't' => TrustLevel::Trusted,
-            'U' | 'u' => TrustLevel::UnTrusted,
-            'D' | 'd' => TrustLevel::Dead,
+    /// Parse a trust token from `trust.log` or a UI shorthand.
+    ///
+    /// git-annex `trust.log` uses `1` (trusted), `0` (untrusted), `?` (semitrusted),
+    /// `X` (dead). Letter / word forms are accepted for robustness.
+    pub fn from_token(s: &str) -> Self {
+        match s.trim() {
+            "1" | "T" | "t" | "trusted" => TrustLevel::Trusted,
+            "0" | "U" | "u" | "untrusted" => TrustLevel::UnTrusted,
+            "X" | "x" | "D" | "d" | "dead" => TrustLevel::Dead,
             _ => TrustLevel::SemiTrusted,
         }
+    }
+
+    pub fn from_char(c: char) -> Self {
+        let mut buf = [0u8; 4];
+        Self::from_token(c.encode_utf8(&mut buf))
     }
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -69,12 +78,16 @@ pub struct Remote {
 
 impl Remote {
     pub fn name(&self) -> &str {
-        self.config.get("name")
+        self.config
+            .get("name")
             .map(|s| s.as_str())
             .unwrap_or(&self.description)
     }
     pub fn rtype(&self) -> &str {
-        self.config.get("type").map(|s| s.as_str()).unwrap_or("repo")
+        self.config
+            .get("type")
+            .map(|s| s.as_str())
+            .unwrap_or("repo")
     }
     pub fn is_special(&self) -> bool {
         self.config.contains_key("type")
@@ -142,8 +155,13 @@ pub struct RepoSummary {
 
 impl AnnexMetadata {
     pub fn to_summary(&self) -> RepoSummary {
-        let here_present = self.remotes.get(&self.uuid).map(|r| r.present_count).unwrap_or(0);
-        let name = self.root
+        let here_present = self
+            .remotes
+            .get(&self.uuid)
+            .map(|r| r.present_count)
+            .unwrap_or(0);
+        let name = self
+            .root
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.description.clone());
@@ -195,7 +213,8 @@ impl RepoSummary {
     /// Ensure we have a usable display name (for old caches or minimal entries)
     pub fn ensure_name(&mut self) {
         if self.name.is_empty() {
-            self.name = self.root
+            self.name = self
+                .root
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| self.annex_description.clone());
@@ -218,7 +237,8 @@ pub fn is_annex_repo(path: &Path) -> bool {
     }
     // Check for git-annex branch without side effect
     Command::new("git")
-        .arg("-C").arg(path)
+        .arg("-C")
+        .arg(path)
         .arg("rev-parse")
         .arg("--verify")
         .arg("--quiet")
@@ -238,8 +258,12 @@ pub fn find_annex_repos(root: &Path) -> Vec<PathBuf> {
         .filter_entry(|e| {
             // prune obvious heavy / non-repo dirs; still allow .git to detect
             let name = e.file_name().to_string_lossy().to_string();
-            if name == ".git" { return true; }
-            if e.depth() <= 2 { return true; }
+            if name == ".git" {
+                return true;
+            }
+            if e.depth() <= 2 {
+                return true;
+            }
             !name.starts_with('.') && name != "target" && name != "node_modules"
         })
     {
@@ -256,9 +280,41 @@ pub fn find_annex_repos(root: &Path) -> Vec<PathBuf> {
     repos
 }
 
+/// Parse a git-annex log timestamp (`1317929189.157237s` or `1317929189s`) to unix seconds.
+pub fn parse_annex_timestamp(raw: &str) -> Option<i64> {
+    let s = raw.trim().trim_end_matches('s').trim();
+    if s.is_empty() {
+        return None;
+    }
+    let secs = s.split_once('.').map(|(a, _)| a).unwrap_or(s);
+    secs.parse().ok()
+}
+
+/// Split `... timestamp=UNIXs` off a log line. Returns (prefix, timestamp).
+fn split_log_timestamp(line: &str) -> (&str, Option<i64>) {
+    if let Some(pos) = line.find(" timestamp=") {
+        let ts = parse_annex_timestamp(&line[pos + 11..]);
+        (line[..pos].trim_end(), ts)
+    } else if let Some(pos) = line.find("timestamp=") {
+        let ts = parse_annex_timestamp(&line[pos + 10..]);
+        (line[..pos].trim_end(), ts)
+    } else {
+        (line, None)
+    }
+}
+
+fn keep_latest<T>(slot: &mut Option<(i64, T)>, ts: Option<i64>, value: T) {
+    let ts = ts.unwrap_or(0);
+    match slot {
+        Some((old, _)) if ts < *old => {}
+        _ => *slot = Some((ts, value)),
+    }
+}
+
 fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
-        .arg("-C").arg(repo)
+        .arg("-C")
+        .arg(repo)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -271,203 +327,277 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Parse a simple space separated log like "uuid desc timestamp=123s"
+/// Parse uuid.log. Last-write-wins per UUID using the line timestamp.
 fn parse_uuid_log(text: &str) -> Vec<(String, String, Option<i64>)> {
-    let mut out = vec![];
+    let mut latest: HashMap<String, (i64, String)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut parts = line.splitn(2, ' ');
+        if line.is_empty() {
+            continue;
+        }
+        let (body, ts) = split_log_timestamp(line);
+        let mut parts = body.splitn(2, ' ');
         let uuid = parts.next().unwrap_or("").to_string();
-        let rest = parts.next().unwrap_or("");
-        let mut desc = rest.to_string();
-        let mut ts = None;
-        if let Some(pos) = rest.find("timestamp=") {
-            desc = rest[..pos].trim().to_string();
-            let ts_part = &rest[pos + 10..];
-            if let Some(end) = ts_part.find('s') {
-                if let Ok(t) = ts_part[..end].parse::<i64>() {
-                    ts = Some(t);
-                }
+        if uuid.is_empty() {
+            continue;
+        }
+        let desc = parts.next().unwrap_or("").trim().to_string();
+        let desc = if desc.is_empty() { uuid.clone() } else { desc };
+        let ts = ts.unwrap_or(0);
+        match latest.get(&uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid, (ts, desc));
             }
         }
-        if !uuid.is_empty() {
-            let d = if desc.is_empty() { uuid.clone() } else { desc };
-            out.push((uuid, d, ts));
-        }
     }
-    out
+    latest
+        .into_iter()
+        .map(|(uuid, (ts, desc))| (uuid, desc, Some(ts)))
+        .collect()
 }
 
 fn parse_remote_log(text: &str) -> HashMap<String, HashMap<String, String>> {
-    let mut map: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut latest: HashMap<String, (i64, HashMap<String, String>)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut it = line.split_whitespace();
-        let uuid = it.next().unwrap_or("").to_string();
-        if uuid.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
+        let (body, ts) = split_log_timestamp(line);
+        let mut it = body.split_whitespace();
+        let Some(uuid) = it.next().filter(|u| !u.is_empty()) else {
+            continue;
+        };
         let mut cfg = HashMap::new();
         for tok in it {
             if let Some((k, v)) = tok.split_once('=') {
-                cfg.insert(k.to_string(), v.to_string());
+                if is_secret_remote_key(k) {
+                    cfg.insert(k.to_string(), "[redacted]".to_string());
+                } else {
+                    cfg.insert(k.to_string(), v.to_string());
+                }
             }
         }
-        map.insert(uuid, cfg);
+        let ts = ts.unwrap_or(0);
+        match latest.get(uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid.to_string(), (ts, cfg));
+            }
+        }
     }
-    map
+    latest.into_iter().map(|(u, (_, cfg))| (u, cfg)).collect()
 }
 
 fn parse_trust_log(text: &str) -> HashMap<String, TrustLevel> {
-    let mut m = HashMap::new();
+    let mut latest: HashMap<String, (i64, TrustLevel)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut parts = line.split_whitespace();
-        let uuid = parts.next().unwrap_or("").to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let (body, ts) = split_log_timestamp(line);
+        let mut parts = body.split_whitespace();
+        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
+            continue;
+        };
         let flag = parts.next().unwrap_or("?");
-        let lvl = TrustLevel::from_char(flag.chars().next().unwrap_or('?'));
-        if !uuid.is_empty() {
-            m.insert(uuid, lvl);
+        let lvl = TrustLevel::from_token(flag);
+        let ts = ts.unwrap_or(0);
+        match latest.get(uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid.to_string(), (ts, lvl));
+            }
         }
     }
-    m
+    latest.into_iter().map(|(u, (_, t))| (u, t)).collect()
 }
 
 fn parse_activity_log(text: &str) -> HashMap<String, i64> {
     // lines like: UUID Fsck timestamp=UNIXs
-    let mut m = HashMap::new();
+    let mut m: HashMap<String, i64> = HashMap::new();
     for line in text.lines() {
-        if let Some(uuid) = line.split_whitespace().next() {
-            if let Some(pos) = line.find("Fsck timestamp=") {
-                let ts_str = &line[pos + 15..];
-                if let Some(end) = ts_str.find('s') {
-                    if let Ok(ts) = ts_str[..end].parse::<i64>() {
-                        m.insert(uuid.to_string(), ts);
-                    }
-                }
-            }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(uuid) = line.split_whitespace().next() else {
+            continue;
+        };
+        if !line.contains("Fsck") {
+            continue;
+        }
+        let (_, ts) = split_log_timestamp(line);
+        let Some(ts) = ts else {
+            continue;
+        };
+        let e = m.entry(uuid.to_string()).or_insert(ts);
+        if ts > *e {
+            *e = ts;
         }
     }
     m
 }
 
 fn parse_group_log(text: &str) -> HashMap<String, Vec<String>> {
-    // group.log format: UUID groupname [timestamp=UNIX.s]
-    // We need the *current* groups, not historical ones.
-    // Strategy: for each (uuid, group) keep the highest timestamp.
-    // Then for each uuid take the groups that have the overall max timestamp for that uuid.
-    let mut by_uuid: HashMap<String, HashMap<String, i64>> = HashMap::new();
-
+    // Official format: UUID group1 group2 ... timestamp=UNIX.s
+    // The line with the highest timestamp is the complete current set.
+    let mut latest: HashMap<String, (i64, Vec<String>)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-
-        // Split off the timestamp part if present
-        let (before_ts, ts_str) = if let Some(pos) = line.find(" timestamp=") {
-            (&line[0..pos], &line[pos + 11..])
-        } else {
-            (line, "")
-        };
-
-        let mut parts = before_ts.split_whitespace();
-        let uuid = parts.next().unwrap_or("").to_string();
-        let group = parts.next().unwrap_or("").to_string();
-
-        if uuid.is_empty() || group.is_empty() || group.starts_with("timestamp=") {
+        if line.is_empty() {
             continue;
         }
-
-        // Parse timestamp (e.g. 1699273888.593667289s)
-        let ts = if let Some(end) = ts_str.find('s') {
-            ts_str[..end].parse::<i64>().unwrap_or(0)
-        } else {
-            0
-        };
-
-        let groups = by_uuid.entry(uuid).or_default();
-        let current = groups.get(&group).copied().unwrap_or(-1);
-        if ts > current {
-            groups.insert(group, ts);
-        }
-    }
-
-    // Now reduce to current groups per uuid (those sharing the max timestamp)
-    let mut result: HashMap<String, Vec<String>> = HashMap::new();
-    for (uuid, group_ts) in by_uuid {
-        if group_ts.is_empty() {
+        let (body, ts) = split_log_timestamp(line);
+        let mut parts = body.split_whitespace();
+        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
             continue;
-        }
-        let max_ts = *group_ts.values().max().unwrap();
-        let current_groups: Vec<String> = group_ts
-            .into_iter()
-            .filter(|(_, t)| *t == max_ts)
-            .map(|(g, _)| g)
+        };
+        let mut groups: Vec<String> = parts
+            .filter(|g| !g.is_empty() && !g.starts_with("timestamp="))
+            .map(|g| g.to_string())
             .collect();
-        result.insert(uuid, current_groups);
+        groups.sort();
+        groups.dedup();
+        let ts = ts.unwrap_or(0);
+        match latest.get(uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid.to_string(), (ts, groups));
+            }
+        }
     }
-    result
+    latest.into_iter().map(|(u, (_, g))| (u, g)).collect()
 }
 
 fn parse_content_log(text: &str) -> HashMap<String, String> {
-    // preferred-content.log / required-content.log format:
-    // uuid <expression> [timestamp=...]
-    let mut m = HashMap::new();
+    // preferred-content.log / required-content.log:
+    // uuid <expression> timestamp=...
+    let mut latest: HashMap<String, (i64, String)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let mut parts = line.splitn(2, ' ');
-        let uuid = parts.next().unwrap_or("").to_string();
-        let mut expr = parts.next().unwrap_or("").to_string();
-        if let Some(pos) = expr.find(" timestamp=") {
-            expr = expr[..pos].trim().to_string();
+        if line.is_empty() {
+            continue;
         }
-        if !uuid.is_empty() {
-            m.insert(uuid, expr);
+        let (body, ts) = split_log_timestamp(line);
+        let mut parts = body.splitn(2, ' ');
+        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let expr = parts.next().unwrap_or("").trim().to_string();
+        let ts = ts.unwrap_or(0);
+        match latest.get(uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid.to_string(), (ts, expr));
+            }
         }
     }
-    m
+    latest.into_iter().map(|(u, (_, e))| (u, e)).collect()
+}
+
+/// numcopies.log / mincopies.log: `timestamp number` (timestamp-first).
+fn parse_count_log(text: &str) -> Option<u32> {
+    let mut best: Option<(i64, u32)> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(ts) = parts.next().and_then(parse_annex_timestamp) else {
+            continue;
+        };
+        let Some(n) = parts.next().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        keep_latest(&mut best, Some(ts), n);
+    }
+    best.map(|(_, n)| n)
 }
 
 pub fn parse_size_from_key(key: &str) -> Option<u64> {
-    // SHA256E-s12345-...
-    if let Some(s_pos) = key.find("-s") {
-        let rest = &key[s_pos + 2..];
-        if let Some(end) = rest.find('-').or_else(|| rest.find("--")) {
-            rest[..end].parse::<u64>().ok()
-        } else {
-            rest.parse::<u64>().ok()
+    // Standard key: BACKEND[-sSIZE][-mMTIME][-S..]--HASH
+    let prefix = key.split_once("--").map(|(p, _)| p).unwrap_or(key);
+    for field in prefix.split('-').skip(1) {
+        if let Some(rest) = field.strip_prefix('s') {
+            if let Ok(n) = rest.parse::<u64>() {
+                return Some(n);
+            }
         }
-    } else {
-        None
     }
+    None
+}
+
+fn is_secret_remote_key(k: &str) -> bool {
+    matches!(
+        k,
+        "cipher" | "embedcreds" | "encryptionkey" | "secret" | "password" | "keyid"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct WhereisRemoteJson {
+    #[serde(default)]
+    uuid: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhereisJson {
+    key: Option<String>,
+    #[serde(default)]
+    whereis: Vec<WhereisRemoteJson>,
+    #[serde(default)]
+    untrusted: Vec<WhereisRemoteJson>,
+}
+
+impl WhereisJson {
+    fn uuids(&self) -> HashSet<String> {
+        self.whereis
+            .iter()
+            .chain(self.untrusted.iter())
+            .map(|r| r.uuid.as_str())
+            .filter(|u| !u.is_empty())
+            .map(|u| u.to_string())
+            .collect()
+    }
+}
+
+fn parse_whereis_json_lines(stdout: &str) -> HashMap<String, HashSet<String>> {
+    let mut locations = HashMap::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(val) = serde_json::from_str::<WhereisJson>(line) {
+            if let Some(key) = val.key.clone() {
+                locations.insert(key, val.uuids());
+            }
+        }
+    }
+    locations
 }
 
 /// Query live locations for a specific key using git annex whereis --json.
 /// This can be used as fallback when the batch whereis at load time didn't have the record.
 pub fn get_live_locations_for_key(repo: &Path, key: &str) -> Result<HashSet<String>> {
     let output = Command::new("git")
-        .arg("-C").arg(repo)
-        .arg("annex").arg("whereis").arg("--json").arg(key)
+        .arg("-C")
+        .arg(repo)
+        .arg("annex")
+        .arg("whereis")
+        .arg("--json")
+        .arg(format!("--key={key}"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;
-    let mut present = HashSet::new();
     let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(whereis_arr) = val.get("whereis").and_then(|w| w.as_array()) {
-                for item in whereis_arr {
-                    if let Some(u) = item.get("uuid").and_then(|u| u.as_str()) {
-                        if !u.is_empty() {
-                            present.insert(u.to_string());
-                        }
-                    }
-                }
-            }
-        }
+    let mut present = HashSet::new();
+    for locs in parse_whereis_json_lines(&stdout).into_values() {
+        present.extend(locs);
     }
     Ok(present)
 }
@@ -487,7 +617,12 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         .to_string();
     let numcopies = run_git(&root, &["config", "--get", "annex.numcopies"])
         .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .or_else(|| {
+            run_git(&root, &["show", "git-annex:numcopies.log"])
+                .ok()
+                .and_then(|t| parse_count_log(&t))
+        });
 
     // Read logs from git-annex branch
     let uuid_log = run_git(&root, &["show", "git-annex:uuid.log"]).unwrap_or_default();
@@ -495,8 +630,10 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let trust_log = run_git(&root, &["show", "git-annex:trust.log"]).unwrap_or_default();
     let activity_log = run_git(&root, &["show", "git-annex:activity.log"]).unwrap_or_default();
     let group_log = run_git(&root, &["show", "git-annex:group.log"]).unwrap_or_default();
-    let preferred_log = run_git(&root, &["show", "git-annex:preferred-content.log"]).unwrap_or_default();
-    let required_log = run_git(&root, &["show", "git-annex:required-content.log"]).unwrap_or_default();
+    let preferred_log =
+        run_git(&root, &["show", "git-annex:preferred-content.log"]).unwrap_or_default();
+    let required_log =
+        run_git(&root, &["show", "git-annex:required-content.log"]).unwrap_or_default();
 
     let uuid_entries = parse_uuid_log(&uuid_log);
     let remote_cfgs = parse_remote_log(&remote_log);
@@ -515,19 +652,26 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         let last_fsck = fscks.get(u).copied();
         let description = if d == u && cfg.contains_key("name") {
             cfg.get("name").unwrap().clone()
-        } else if d.is_empty() { u.clone() } else { d.clone() };
-        remotes.insert(u.clone(), Remote {
-            uuid: u.clone(),
-            description,
-            config: cfg,
-            trust,
-            last_fsck,
-            present_count: 0,
-            available_space: None,
-            groups: vec![],
-            wanted: None,
-            required: None,
-        });
+        } else if d.is_empty() {
+            u.clone()
+        } else {
+            d.clone()
+        };
+        remotes.insert(
+            u.clone(),
+            Remote {
+                uuid: u.clone(),
+                description,
+                config: cfg,
+                trust,
+                last_fsck,
+                present_count: 0,
+                available_space: None,
+                groups: vec![],
+                wanted: None,
+                required: None,
+            },
+        );
     }
 
     // Ensure any only-in-remote.log are present
@@ -536,18 +680,21 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
             let trust = trusts.get(u).copied().unwrap_or(TrustLevel::SemiTrusted);
             let last_fsck = fscks.get(u).copied();
             let description = cfg.get("name").cloned().unwrap_or_else(|| u.clone());
-            remotes.insert(u.clone(), Remote {
-                uuid: u.clone(),
-                description,
-                config: cfg.clone(),
-                trust,
-                last_fsck,
-                present_count: 0,
-                available_space: None,
-                groups: vec![],
-                wanted: None,
-                required: None,
-            });
+            remotes.insert(
+                u.clone(),
+                Remote {
+                    uuid: u.clone(),
+                    description,
+                    config: cfg.clone(),
+                    trust,
+                    last_fsck,
+                    present_count: 0,
+                    available_space: None,
+                    groups: vec![],
+                    wanted: None,
+                    required: None,
+                },
+            );
         }
     }
 
@@ -555,18 +702,28 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     if !uuid.is_empty() && !remotes.contains_key(&uuid) {
         let mut cfg = HashMap::new();
         cfg.insert("name".to_string(), "here".to_string());
-        remotes.insert(uuid.clone(), Remote {
-            uuid: uuid.clone(),
-            description: if desc.is_empty() { "here".to_string() } else { desc.clone() },
-            config: cfg,
-            trust: trusts.get(&uuid).copied().unwrap_or(TrustLevel::SemiTrusted),
-            last_fsck: fscks.get(&uuid).copied(),
-            present_count: 0,
-            available_space: None,
-            groups: vec![],
-            wanted: None,
-            required: None,
-        });
+        remotes.insert(
+            uuid.clone(),
+            Remote {
+                uuid: uuid.clone(),
+                description: if desc.is_empty() {
+                    "here".to_string()
+                } else {
+                    desc.clone()
+                },
+                config: cfg,
+                trust: trusts
+                    .get(&uuid)
+                    .copied()
+                    .unwrap_or(TrustLevel::SemiTrusted),
+                last_fsck: fscks.get(&uuid).copied(),
+                present_count: 0,
+                available_space: None,
+                groups: vec![],
+                wanted: None,
+                required: None,
+            },
+        );
     }
 
     // Assign groups / wanted / required to remotes (including here)
@@ -613,8 +770,11 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Load files + keys + locations
     let annexed_paths = {
         let out = Command::new("git")
-            .arg("-C").arg(&root)
-            .arg("annex").arg("find").arg("--print0")
+            .arg("-C")
+            .arg(&root)
+            .arg("annex")
+            .arg("find")
+            .arg("--print0")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()?;
@@ -635,8 +795,12 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let mut files: Vec<AnnexedFile> = vec![];
     if !annexed_paths.is_empty() {
         let mut child = Command::new("git")
-            .arg("-C").arg(&root)
-            .arg("annex").arg("lookupkey").arg("--batch")
+            .arg("-C")
+            .arg(&root)
+            .arg("annex")
+            .arg("lookupkey")
+            .arg("--batch")
+            .arg("-z")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -644,7 +808,8 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         {
             let mut stdin = child.stdin.take().unwrap();
             for p in &annexed_paths {
-                writeln!(stdin, "{}", p)?;
+                stdin.write_all(p.as_bytes())?;
+                stdin.write_all(&[0])?;
             }
         }
         let stdout = child.stdout.take().unwrap();
@@ -661,40 +826,20 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         let _ = child.wait();
     }
 
-    // Build locations using whereis --json --all  (NDJSON)
-    let mut locations: HashMap<String, HashSet<String>> = HashMap::new();
+    // Build locations using whereis --json --all  (NDJSON). Include the
+    // `untrusted` array so copies on untrusted drives are not dropped.
     let whereis_out = Command::new("git")
-        .arg("-C").arg(&root)
-        .arg("annex").arg("whereis").arg("--json").arg("--all")
+        .arg("-C")
+        .arg(&root)
+        .arg("annex")
+        .arg("whereis")
+        .arg("--json")
+        .arg("--all")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()?;
-    // Always try to parse stdout. git annex whereis --json --all can succeed in outputting
-    // useful JSON even if the overall command exits non-zero (warnings, etc.).
     let stdout = String::from_utf8_lossy(&whereis_out.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        // Use proper JSON parsing for speed and correctness on large outputs
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(key) = val.get("key").and_then(|k| k.as_str()) {
-                let mut present = HashSet::new();
-                if let Some(whereis_arr) = val.get("whereis").and_then(|w| w.as_array()) {
-                    for item in whereis_arr {
-                        if let Some(u) = item.get("uuid").and_then(|u| u.as_str()) {
-                            if !u.is_empty() {
-                                present.insert(u.to_string());
-                            }
-                        }
-                    }
-                }
-                locations.insert(key.to_string(), present);
-            }
-        }
-    }
-    if !whereis_out.status.success() {
-        // We still parsed what we could. Log status is ignored for robustness.
-    }
+    let locations = parse_whereis_json_lines(&stdout);
 
     // Compute present counts
     let mut present_counts: HashMap<String, usize> = HashMap::new();
@@ -736,8 +881,14 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
 
     // Fill local desc if empty
     let description = if desc.is_empty() {
-        uuid_entries.iter().find(|(u,_d,_)| u == &uuid).map(|(_,d,_)| d.clone()).unwrap_or_else(|| uuid.clone())
-    } else { desc };
+        uuid_entries
+            .iter()
+            .find(|(u, _d, _)| u == &uuid)
+            .map(|(_, d, _)| d.clone())
+            .unwrap_or_else(|| uuid.clone())
+    } else {
+        desc
+    };
 
     Ok(AnnexMetadata {
         root,
@@ -760,9 +911,14 @@ pub fn short_name(meta: &AnnexMetadata, uuid: &str) -> String {
     if uuid == meta.uuid {
         return "here".to_string();
     }
-    meta.remotes.get(uuid)
+    meta.remotes
+        .get(uuid)
         .map(|r| {
-            if r.name() != r.uuid { r.name().to_string() } else { r.description.clone() }
+            if r.name() != r.uuid {
+                r.name().to_string()
+            } else {
+                r.description.clone()
+            }
         })
         .unwrap_or_else(|| uuid[..8.min(uuid.len())].to_string())
 }
@@ -772,7 +928,9 @@ fn remote_drive_path(rem: &Remote, repo_root: &Path, here_uuid: &str) -> Option<
     if let Some(dir) = rem.config.get("directory") {
         let p = PathBuf::from(dir);
         // Only return if it currently exists (drive may be unmounted)
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     if rem.uuid == here_uuid {
         return Some(repo_root.to_path_buf());
@@ -793,8 +951,8 @@ fn fill_drive_spaces(repo_root: &Path, here_uuid: &str, remotes: &mut HashMap<St
 
 /// Query filesystem available and total bytes for a path using statvfs (Linux).
 pub fn get_fs_space(path: &Path) -> Option<(u64, u64)> {
-    use std::ffi::CString;
     use libc::statvfs;
+    use std::ffi::CString;
     let cpath = CString::new(path.to_str()?).ok()?;
     let mut st: statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: cpath is valid nul-terminated, st is properly sized.
@@ -832,16 +990,21 @@ impl DriveProfile {
         self.trusts.iter().max_by_key(|(_, c)| *c).map(|(t, _)| *t)
     }
     pub fn most_common_groups(&self) -> Option<Vec<String>> {
-        self.group_sets.iter().max_by_key(|(_, c)| *c).map(|(g, _)| g.clone())
+        self.group_sets
+            .iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(g, _)| g.clone())
     }
     pub fn most_common_wanted(&self) -> Option<String> {
-        self.wanteds.iter()
+        self.wanteds
+            .iter()
             .filter(|(w, _)| w.is_some())
             .max_by_key(|(_, c)| *c)
             .and_then(|(w, _)| w.clone())
     }
     pub fn most_common_required(&self) -> Option<String> {
-        self.requireds.iter()
+        self.requireds
+            .iter()
             .filter(|(r, _)| r.is_some())
             .max_by_key(|(_, c)| *c)
             .and_then(|(r, _)| r.clone())
@@ -882,18 +1045,156 @@ pub fn save_cache(cache: &AnnexCache) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamp_fractional_and_integer() {
+        assert_eq!(
+            parse_annex_timestamp("1317929189.157237s"),
+            Some(1317929189)
+        );
+        assert_eq!(
+            parse_annex_timestamp("1699273888.593667289s"),
+            Some(1699273888)
+        );
+        assert_eq!(parse_annex_timestamp("1422387398s"), Some(1422387398));
+        assert_eq!(parse_annex_timestamp("  42.0s  "), Some(42));
+        assert_eq!(parse_annex_timestamp(""), None);
+        assert_eq!(parse_annex_timestamp("not-a-time"), None);
+    }
+
+    #[test]
+    fn trust_tokens_match_git_annex_log() {
+        assert_eq!(TrustLevel::from_token("1"), TrustLevel::Trusted);
+        assert_eq!(TrustLevel::from_token("0"), TrustLevel::UnTrusted);
+        assert_eq!(TrustLevel::from_token("?"), TrustLevel::SemiTrusted);
+        assert_eq!(TrustLevel::from_token("X"), TrustLevel::Dead);
+        assert_eq!(TrustLevel::from_token("trusted"), TrustLevel::Trusted);
+        assert_eq!(TrustLevel::from_char('1'), TrustLevel::Trusted);
+    }
+
+    #[test]
+    fn trust_log_last_write_wins_and_fractional_ts() {
+        let text = "\
+aaa-aaa 1 timestamp=100.1s
+aaa-aaa 0 timestamp=200.9s
+bbb-bbb ? timestamp=50.0s
+ccc-ccc X timestamp=10s
+aaa-aaa 1 timestamp=150.0s
+";
+        let m = parse_trust_log(text);
+        assert_eq!(m.get("aaa-aaa"), Some(&TrustLevel::UnTrusted));
+        assert_eq!(m.get("bbb-bbb"), Some(&TrustLevel::SemiTrusted));
+        assert_eq!(m.get("ccc-ccc"), Some(&TrustLevel::Dead));
+    }
+
+    #[test]
+    fn uuid_log_keeps_latest_description_with_spaces() {
+        let text = "\
+e605dca6-446a-11e0-8b2a-002170d25c55 laptop timestamp=1317929189.157237s
+26339d22-446b-11e0-9101-002170d25c55 usb disk timestamp=1317929330.769997s
+e605dca6-446a-11e0-8b2a-002170d25c55 new laptop name timestamp=2000000000.0s
+e605dca6-446a-11e0-8b2a-002170d25c55 stale timestamp=1000s
+";
+        let v = parse_uuid_log(text);
+        let laptop = v
+            .iter()
+            .find(|(u, _, _)| u.starts_with("e605dca6"))
+            .unwrap();
+        assert_eq!(laptop.1, "new laptop name");
+        let usb = v
+            .iter()
+            .find(|(u, _, _)| u.starts_with("26339d22"))
+            .unwrap();
+        assert_eq!(usb.1, "usb disk");
+    }
+
+    #[test]
+    fn group_log_reads_all_groups_on_latest_line() {
+        let text = "\
+u1 archive timestamp=100.1s
+u1 archive backup client timestamp=200.5s
+u1 only-old timestamp=50s
+u2 transfer timestamp=10s
+";
+        let m = parse_group_log(text);
+        let mut g1 = m.get("u1").cloned().unwrap();
+        g1.sort();
+        assert_eq!(g1, vec!["archive", "backup", "client"]);
+        assert_eq!(m.get("u2"), Some(&vec!["transfer".to_string()]));
+    }
+
+    #[test]
+    fn content_log_last_write_wins() {
+        let text = "\
+u1 include=*.jpg timestamp=10.1s
+u1 exclude=* timestamp=20.2s
+u1 include=*.png timestamp=15s
+";
+        let m = parse_content_log(text);
+        assert_eq!(m.get("u1").map(String::as_str), Some("exclude=*"));
+    }
+
+    #[test]
+    fn activity_log_fractional_fsck() {
+        let text = "\
+u1 Fsck timestamp=1422387398.30395s
+u1 Fsck timestamp=1000.0s
+u2 something else timestamp=9s
+";
+        let m = parse_activity_log(text);
+        assert_eq!(m.get("u1"), Some(&1422387398));
+        assert!(!m.contains_key("u2"));
+    }
+
+    #[test]
+    fn numcopies_log_timestamp_first() {
+        let text = "\
+100.1s 1
+200.9s 3
+150s 2
+";
+        assert_eq!(parse_count_log(text), Some(3));
+    }
+
+    #[test]
+    fn size_from_standard_keys() {
+        assert_eq!(parse_size_from_key("SHA256E-s12345--abcd"), Some(12345));
+        assert_eq!(
+            parse_size_from_key("SHA256E-s86558--e79a0891bb94fc9212ce2f28178fe84591c5fb24c07b5239d367099118e12ede.jpg"),
+            Some(86558)
+        );
+        assert_eq!(parse_size_from_key("WORM-s99-m100--name"), Some(99));
+        assert_eq!(parse_size_from_key("URL--http://example"), None);
+    }
+
+    #[test]
+    fn remote_log_redacts_cipher() {
+        let text = "u1 type=S3 name=bucket cipher=SUPERSECRET timestamp=10s\n";
+        let m = parse_remote_log(text);
+        assert_eq!(m["u1"].get("type").map(String::as_str), Some("S3"));
+        assert_eq!(
+            m["u1"].get("cipher").map(String::as_str),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn whereis_json_includes_untrusted() {
+        let line = r#"{"key":"SHA256E-s1--aa","whereis":[{"uuid":"here-uuid"}],"untrusted":[{"uuid":"usb-uuid"}]}"#;
+        let locs = parse_whereis_json_lines(line);
+        let set = locs.get("SHA256E-s1--aa").unwrap();
+        assert!(set.contains("here-uuid"));
+        assert!(set.contains("usb-uuid"));
+    }
+
     #[test]
     fn test_find_and_load_demo() {
-        // This test looks for a demo annex at /tmp/annex-demo for manual testing.
-        // It is skipped if the demo repo is not present.
-        let p = std::path::Path::new("/tmp/annex-demo");
+        let p = Path::new("/tmp/annex-demo");
         if !is_annex_repo(p) {
-            eprintln!("demo not present, skipping load test");
             return;
         }
         let meta = load_metadata(p).expect("load demo");
         assert!(!meta.uuid.is_empty());
-        assert!(meta.remotes.len() >= 1);
-        println!("loaded demo: files={} remotes={} keys={}", meta.files.len(), meta.remotes.len(), meta.total_keys);
+        assert!(!meta.remotes.is_empty());
     }
 }
