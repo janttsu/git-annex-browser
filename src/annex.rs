@@ -222,20 +222,31 @@ impl RepoSummary {
     }
 }
 
+/// Resolve the git directory for a work tree (plain `.git` dir or `gitdir:` file).
+fn resolve_git_dir(path: &Path) -> Option<PathBuf> {
+    let git = path.join(".git");
+    if git.is_dir() {
+        return Some(git);
+    }
+    if git.is_file() {
+        let text = std::fs::read_to_string(&git).ok()?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("gitdir:") {
+                let p = PathBuf::from(rest.trim());
+                return Some(if p.is_absolute() { p } else { path.join(p) });
+            }
+        }
+    }
+    None
+}
+
 pub fn is_annex_repo(path: &Path) -> bool {
-    // Has .git/annex or git-annex branch
-    let git_dir = if path.join(".git").is_dir() {
-        path.join(".git")
-    } else if path.join(".git").is_file() {
-        // worktree or submodule etc, skip for simplicity or resolve
-        return false;
-    } else {
+    let Some(git_dir) = resolve_git_dir(path) else {
         return false;
     };
     if git_dir.join("annex").exists() {
         return true;
     }
-    // Check for git-annex branch without side effect
     Command::new("git")
         .arg("-C")
         .arg(path)
@@ -252,28 +263,28 @@ pub fn is_annex_repo(path: &Path) -> bool {
 
 pub fn find_annex_repos(root: &Path) -> Vec<PathBuf> {
     let mut repos = Vec::new();
-    for entry in walkdir::WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| {
-            // prune obvious heavy / non-repo dirs; still allow .git to detect
-            let name = e.file_name().to_string_lossy().to_string();
-            if name == ".git" {
-                return true;
-            }
-            if e.depth() <= 2 {
-                return true;
-            }
-            !name.starts_with('.') && name != "target" && name != "node_modules"
-        })
-    {
-        if let Ok(e) = entry {
-            if e.file_type().is_dir() && e.file_name() == ".git" {
-                let repo_root = e.path().parent().unwrap().to_path_buf();
-                if is_annex_repo(&repo_root) {
-                    repos.push(repo_root);
-                }
-            }
+    let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(e) = entry else {
+            continue;
+        };
+        if !e.file_type().is_dir() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy();
+        if name == ".git" {
+            it.skip_current_dir();
+            continue;
+        }
+        let skip_noise = name == "target" || name == "node_modules";
+        let skip_hidden = e.depth() > 2 && name.starts_with('.');
+        if skip_noise || skip_hidden {
+            it.skip_current_dir();
+            continue;
+        }
+        if is_annex_repo(e.path()) {
+            repos.push(e.path().to_path_buf());
+            it.skip_current_dir();
         }
     }
     repos.sort();
@@ -1185,6 +1196,66 @@ u2 something else timestamp=9s
         let set = locs.get("SHA256E-s1--aa").unwrap();
         assert!(set.contains("here-uuid"));
         assert!(set.contains("usb-uuid"));
+    }
+
+    fn mkdir(p: &Path) {
+        std::fs::create_dir_all(p).unwrap();
+    }
+
+    fn touch_annex_git(repo: &Path) {
+        mkdir(&repo.join(".git/annex/objects/aa/bb/FAKEKEY"));
+        std::fs::write(repo.join(".git/annex/objects/aa/bb/FAKEKEY/FAKEKEY"), b"x").unwrap();
+        // decoy: if we walked objects we would pick this up as another repo
+        mkdir(&repo.join(".git/annex/objects/aa/bb/FAKEKEY/.git/annex"));
+    }
+
+    #[test]
+    fn find_annex_repos_skips_object_store_and_finds_siblings() {
+        let root = std::env::temp_dir().join(format!(
+            "gab-find-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        mkdir(&root);
+        let photos = root.join("photos");
+        let docs = root.join("docs");
+        touch_annex_git(&photos);
+        touch_annex_git(&docs);
+        mkdir(&root.join("plain"));
+        std::fs::write(root.join("plain/file.txt"), b"hi").unwrap();
+
+        let found = find_annex_repos(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found.len(), 2, "found {found:?}");
+        assert!(found
+            .iter()
+            .all(|p| p.ends_with("photos") || p.ends_with("docs")));
+    }
+
+    #[test]
+    fn is_annex_repo_follows_worktree_gitdir_file() {
+        let root = std::env::temp_dir().join(format!(
+            "gab-wt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        mkdir(&root);
+        let git = root.join("real.git");
+        mkdir(&git.join("annex"));
+        let wt = root.join("tree");
+        mkdir(&wt);
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
+        let ok = is_annex_repo(&wt);
+        let found = find_annex_repos(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(ok);
+        assert!(found.iter().any(|p| p.ends_with("tree")), "found {found:?}");
     }
 
     #[test]
