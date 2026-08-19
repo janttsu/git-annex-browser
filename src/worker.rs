@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -203,18 +203,19 @@ pub fn spawn(
 
                     // On-demand load for a loading placeholder (rare now thanks to bg)
                     if let Some(loading) = worker.app.stack.last()
-                        && let Some(p) = loading.node.loading_path() {
-                            match annex::load_metadata(&p) {
-                                Ok(meta) => {
-                                    worker.app.install_loaded_repo(meta);
-                                    dirty = true;
-                                }
-                                Err(e) => {
-                                    worker.app.status = format!("load failed: {}", e);
-                                    worker.app.stack.pop();
-                                }
+                        && let Some(p) = loading.node.loading_path()
+                    {
+                        match annex::load_metadata(&p) {
+                            Ok(meta) => {
+                                worker.app.install_loaded_repo(meta);
+                                dirty = true;
+                            }
+                            Err(e) => {
+                                worker.app.status = format!("load failed: {}", e);
+                                worker.app.stack.pop();
                             }
                         }
+                    }
 
                     let snap = worker.app.snapshot(page);
                     let _ = snap_tx.send(WorkerOut::Nav(snap));
