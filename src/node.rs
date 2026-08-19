@@ -93,7 +93,7 @@ pub struct GlobalReportNode {
 
 impl Node for GlobalReportNode {
     fn label(&self) -> String {
-        "📊 Global report (all repos)".into()
+        "Global report (all repos)".into()
     }
     fn kind(&self) -> &'static str {
         "report"
@@ -557,11 +557,10 @@ impl Node for DriveNode {
 
 impl DrivesNode {
     fn matches_common(&self, p: &crate::annex::DriveProfile, r: &crate::annex::Remote) -> bool {
-        if let Some(ct) = p.most_common_trust() {
-            if r.trust != ct {
+        if let Some(ct) = p.most_common_trust()
+            && r.trust != ct {
                 return false;
             }
-        }
         if let Some(cg) = p.most_common_groups() {
             let mut myg = r.groups.clone();
             myg.sort();
@@ -569,16 +568,14 @@ impl DrivesNode {
                 return false;
             }
         }
-        if let Some(cw) = p.most_common_wanted() {
-            if r.wanted.as_deref() != Some(cw.as_str()) {
+        if let Some(cw) = p.most_common_wanted()
+            && r.wanted.as_deref() != Some(cw.as_str()) {
                 return false;
             }
-        }
-        if let Some(cr) = p.most_common_required() {
-            if r.required.as_deref() != Some(cr.as_str()) {
+        if let Some(cr) = p.most_common_required()
+            && r.required.as_deref() != Some(cr.as_str()) {
                 return false;
             }
-        }
         true
     }
 }

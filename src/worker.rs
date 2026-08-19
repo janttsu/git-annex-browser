@@ -20,6 +20,11 @@ pub enum WorkerMsg {
     Nav(Command, usize /*page size*/),
 }
 
+pub enum WorkerOut {
+    Nav(ViewSnapshot),
+    Background(ViewSnapshot),
+}
+
 pub struct Worker {
     pub app: App,
 }
@@ -27,7 +32,7 @@ pub struct Worker {
 pub fn spawn(
     scan_root: PathBuf,
     cancel: Arc<AtomicBool>,
-) -> (Sender<WorkerMsg>, Receiver<ViewSnapshot>) {
+) -> (Sender<WorkerMsg>, Receiver<WorkerOut>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (snap_tx, snap_rx) = mpsc::channel();
     let (meta_tx, meta_rx) = mpsc::channel::<(PathBuf, Result<annex::AnnexMetadata>)>();
@@ -102,7 +107,7 @@ pub fn spawn(
         }
 
         worker.app.set_discovered(discovered.clone());
-        let _ = snap_tx.send(worker.app.snapshot(20));
+        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
 
         // 3. Background hydration loop + cache updates
         // We interleave with the normal command loop using the timeout path.
@@ -134,7 +139,7 @@ pub fn spawn(
                         worker.app.recompute_drive_profiles();
                         worker.app.refresh_root_view();
                         dirty = true;
-                        let _ = snap_tx.send(worker.app.snapshot(20));
+                        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
                         if last_save.elapsed() > Duration::from_secs(4) {
                             persist_preloaded(&worker.app);
                             last_save = std::time::Instant::now();
@@ -143,7 +148,7 @@ pub fn spawn(
                     }
                     Err(e) => {
                         worker.app.status = format!("failed {}: {}", p.display(), e);
-                        let _ = snap_tx.send(worker.app.snapshot(20));
+                        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
                     }
                 }
             }
@@ -170,7 +175,7 @@ pub fn spawn(
                         dirty = false;
                         worker.app.status =
                             format!("{} repos • cache updated", worker.app.preloaded.len());
-                        let _ = snap_tx.send(worker.app.snapshot(20));
+                        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
                     }
                     continue;
                 }
@@ -197,8 +202,8 @@ pub fn spawn(
                     }
 
                     // On-demand load for a loading placeholder (rare now thanks to bg)
-                    if let Some(loading) = worker.app.stack.last() {
-                        if let Some(p) = loading.node.loading_path() {
+                    if let Some(loading) = worker.app.stack.last()
+                        && let Some(p) = loading.node.loading_path() {
                             match annex::load_metadata(&p) {
                                 Ok(meta) => {
                                     worker.app.install_loaded_repo(meta);
@@ -210,10 +215,9 @@ pub fn spawn(
                                 }
                             }
                         }
-                    }
 
                     let snap = worker.app.snapshot(page);
-                    let _ = snap_tx.send(snap);
+                    let _ = snap_tx.send(WorkerOut::Nav(snap));
                 }
             }
         }

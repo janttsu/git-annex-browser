@@ -1,2 +1,2 @@
-pub mod tui;
 pub mod keyboard;
+pub mod tui;

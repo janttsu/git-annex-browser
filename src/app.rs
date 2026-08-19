@@ -219,7 +219,7 @@ impl App {
         if self
             .stack
             .last()
-            .map_or(false, |l| l.node.loading_path().is_some())
+            .is_some_and(|l| l.node.loading_path().is_some())
         {
             self.stack.pop();
         }
