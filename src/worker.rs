@@ -7,6 +7,7 @@ use crate::annex::{self, RepoSummary};
 use crate::app::{App, Command, ViewSnapshot};
 use anyhow::Result;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -46,8 +47,8 @@ pub fn spawn(
                     continue;
                 }
                 meta.ensure_sizes();
-                worker.app.preloaded.insert(p.clone(), meta.clone());
                 let mut sum = meta.to_summary();
+                worker.app.preloaded.insert(p.clone(), Rc::new(meta));
                 sum.ensure_name();
                 worker.app.summaries.push(sum);
             }
@@ -107,20 +108,22 @@ pub fn spawn(
         // We interleave with the normal command loop using the timeout path.
         let mut dirty = false;
         let mut last_save = std::time::Instant::now();
+        let mut in_flight = 0usize;
+        const MAX_HYDRATE: usize = 2;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
 
-            // Drain any completed metadata loads (from background threads). This keeps the worker responsive.
             while let Ok((p, res)) = meta_rx.try_recv() {
+                in_flight = in_flight.saturating_sub(1);
                 match res {
                     Ok(mut meta) => {
                         meta.ensure_sizes();
                         let mut sum = meta.to_summary();
                         sum.ensure_name();
-                        worker.app.preloaded.insert(p.clone(), meta.clone());
+                        worker.app.preloaded.insert(p.clone(), Rc::new(meta));
                         if let Some(existing) =
                             worker.app.summaries.iter_mut().find(|s| s.root == p)
                         {
@@ -128,6 +131,7 @@ pub fn spawn(
                         } else {
                             worker.app.summaries.push(sum);
                         }
+                        worker.app.recompute_drive_profiles();
                         worker.app.refresh_root_view();
                         dirty = true;
                         let _ = snap_tx.send(worker.app.snapshot(20));
@@ -137,7 +141,10 @@ pub fn spawn(
                             dirty = false;
                         }
                     }
-                    Err(_e) => {}
+                    Err(e) => {
+                        worker.app.status = format!("failed {}: {}", p.display(), e);
+                        let _ = snap_tx.send(worker.app.snapshot(20));
+                    }
                 }
             }
 
@@ -146,13 +153,18 @@ pub fn spawn(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // --- Background work on idle ticks ---
                     // Spawn heavy loads off-thread so UI commands stay responsive.
-                    if let Some(p) = worker.app.to_hydrate.pop() {
+                    while in_flight < MAX_HYDRATE {
+                        let Some(p) = worker.app.to_hydrate.pop() else {
+                            break;
+                        };
+                        in_flight += 1;
                         let meta_tx = meta_tx.clone();
                         std::thread::spawn(move || {
                             let res = annex::load_metadata(&p);
                             let _ = meta_tx.send((p, res));
                         });
-                    } else if dirty && last_save.elapsed() > Duration::from_secs(2) {
+                    }
+                    if in_flight == 0 && dirty && last_save.elapsed() > Duration::from_secs(2) {
                         persist_preloaded(&worker.app);
                         last_save = std::time::Instant::now();
                         dirty = false;
@@ -218,7 +230,7 @@ fn persist_preloaded(app: &App) {
     let repos = app
         .preloaded
         .iter()
-        .map(|(k, v)| (k.to_string_lossy().to_string(), v.clone()))
+        .map(|(k, v)| (k.to_string_lossy().to_string(), v.as_ref().clone()))
         .collect::<Vec<_>>();
     let _ = annex::upsert_cache_repos(repos);
 }
