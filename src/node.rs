@@ -5,7 +5,7 @@ Similar structure to zfs-browser: everything is a Node.
 */
 
 use crate::annex::{
-    parse_size_from_key, AnnexMetadata, AnnexedFile, DriveProfile, Remote, TrustLevel,
+    AnnexMetadata, AnnexedFile, DriveProfile, Remote, TrustLevel, parse_size_from_key,
 };
 use crate::util::{fmt_unix, human_bytes, short_uuid};
 use std::collections::{HashMap, HashSet};
@@ -558,9 +558,10 @@ impl Node for DriveNode {
 impl DrivesNode {
     fn matches_common(&self, p: &crate::annex::DriveProfile, r: &crate::annex::Remote) -> bool {
         if let Some(ct) = p.most_common_trust()
-            && r.trust != ct {
-                return false;
-            }
+            && r.trust != ct
+        {
+            return false;
+        }
         if let Some(cg) = p.most_common_groups() {
             let mut myg = r.groups.clone();
             myg.sort();
@@ -569,13 +570,15 @@ impl DrivesNode {
             }
         }
         if let Some(cw) = p.most_common_wanted()
-            && r.wanted.as_deref() != Some(cw.as_str()) {
-                return false;
-            }
+            && r.wanted.as_deref() != Some(cw.as_str())
+        {
+            return false;
+        }
         if let Some(cr) = p.most_common_required()
-            && r.required.as_deref() != Some(cr.as_str()) {
-                return false;
-            }
+            && r.required.as_deref() != Some(cr.as_str())
+        {
+            return false;
+        }
         true
     }
 }

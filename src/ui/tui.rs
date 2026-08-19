@@ -7,20 +7,20 @@ use crossterm::{
     cursor::{Hide, Show},
     execute,
     terminal::{
-        disable_raw_mode, enable_raw_mode, Clear as CrosstermClear, ClearType,
-        EnterAlternateScreen, LeaveAlternateScreen,
+        Clear as CrosstermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
     },
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem as RatListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
 use std::{
-    io::{stdout, Result as IoResult, Stdout},
+    io::{Result as IoResult, Stdout, stdout},
     panic,
 };
 

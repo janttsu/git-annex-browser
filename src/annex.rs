@@ -185,9 +185,10 @@ impl AnnexMetadata {
             }
             for key in self.locations.keys() {
                 if !key_sizes.contains_key(key)
-                    && let Some(sz) = parse_size_from_key(key) {
-                        key_sizes.insert(key.clone(), sz);
-                    }
+                    && let Some(sz) = parse_size_from_key(key)
+                {
+                    key_sizes.insert(key.clone(), sz);
+                }
             }
             let mut u = 0u64;
             let mut c = 0u64;
@@ -528,9 +529,10 @@ pub fn parse_size_from_key(key: &str) -> Option<u64> {
     let prefix = key.split_once("--").map(|(p, _)| p).unwrap_or(key);
     for field in prefix.split('-').skip(1) {
         if let Some(rest) = field.strip_prefix('s')
-            && let Ok(n) = rest.parse::<u64>() {
-                return Some(n);
-            }
+            && let Ok(n) = rest.parse::<u64>()
+        {
+            return Some(n);
+        }
     }
     None
 }
@@ -577,9 +579,10 @@ fn parse_whereis_json_lines(stdout: &str) -> HashMap<String, HashSet<String>> {
             continue;
         }
         if let Ok(val) = serde_json::from_str::<WhereisJson>(line)
-            && let Some(key) = val.key.clone() {
-                locations.insert(key, val.uuids());
-            }
+            && let Some(key) = val.key.clone()
+        {
+            locations.insert(key, val.uuids());
+        }
     }
     locations
 }
@@ -748,14 +751,15 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Parse top-level .gitattributes for annex.* settings (numcopies per path etc.)
     let ga_path = root.join(".gitattributes");
     if ga_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&ga_path) {
-            for line in content.lines() {
-                let l = line.trim();
-                if l.contains("annex.numcopies") || l.contains("annex.") {
-                    additional_configs.push(format!(".gitattributes: {}", l));
-                }
+        && let Ok(content) = std::fs::read_to_string(&ga_path)
+    {
+        for line in content.lines() {
+            let l = line.trim();
+            if l.contains("annex.numcopies") || l.contains("annex.") {
+                additional_configs.push(format!(".gitattributes: {}", l));
             }
         }
+    }
     // Also pull other annex.* config for visibility
     if let Ok(cfg_list) = run_git(&root, &["config", "--get-regexp", "^annex\\."]) {
         for line in cfg_list.lines() {
@@ -818,11 +822,12 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         let reader = BufReader::new(stdout);
         for (i, line_res) in reader.lines().enumerate() {
             if let Ok(key) = line_res
-                && i < annexed_paths.len() {
-                    let path = annexed_paths[i].clone();
-                    let size = parse_size_from_key(&key);
-                    files.push(AnnexedFile { path, key, size });
-                }
+                && i < annexed_paths.len()
+            {
+                let path = annexed_paths[i].clone();
+                let size = parse_size_from_key(&key);
+                files.push(AnnexedFile { path, key, size });
+            }
         }
         let _ = child.wait();
     }
@@ -864,9 +869,10 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     }
     for key in locations.keys() {
         if !key_sizes.contains_key(key)
-            && let Some(sz) = parse_size_from_key(key) {
-                key_sizes.insert(key.clone(), sz);
-            }
+            && let Some(sz) = parse_size_from_key(key)
+        {
+            key_sizes.insert(key.clone(), sz);
+        }
     }
 
     // Compute storage report
@@ -942,9 +948,10 @@ fn remote_drive_path(rem: &Remote, repo_root: &Path, here_uuid: &str) -> Option<
 fn fill_drive_spaces(repo_root: &Path, here_uuid: &str, remotes: &mut HashMap<String, Remote>) {
     for r in remotes.values_mut() {
         if let Some(p) = remote_drive_path(r, repo_root, here_uuid)
-            && let Some((avail, _total)) = get_fs_space(&p) {
-                r.available_space = Some(avail);
-            }
+            && let Some((avail, _total)) = get_fs_space(&p)
+        {
+            r.available_space = Some(avail);
+        }
     }
 }
 
@@ -1037,18 +1044,20 @@ pub fn path_is_under(path: &Path, root: &Path) -> bool {
 
 pub fn cache_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty() {
-            return PathBuf::from(xdg).join("git-annex-browser");
-        }
+        && !xdg.is_empty()
+    {
+        return PathBuf::from(xdg).join("git-annex-browser");
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".cache").join("git-annex-browser")
 }
 
 pub fn cache_path() -> PathBuf {
     if let Ok(p) = std::env::var("GIT_ANNEX_BROWSER_CACHE")
-        && !p.is_empty() {
-            return PathBuf::from(p);
-        }
+        && !p.is_empty()
+    {
+        return PathBuf::from(p);
+    }
     cache_dir().join("cache.json")
 }
 
@@ -1284,7 +1293,9 @@ u2 something else timestamp=9s
     fn size_from_standard_keys() {
         assert_eq!(parse_size_from_key("SHA256E-s12345--abcd"), Some(12345));
         assert_eq!(
-            parse_size_from_key("SHA256E-s86558--e79a0891bb94fc9212ce2f28178fe84591c5fb24c07b5239d367099118e12ede.jpg"),
+            parse_size_from_key(
+                "SHA256E-s86558--e79a0891bb94fc9212ce2f28178fe84591c5fb24c07b5239d367099118e12ede.jpg"
+            ),
             Some(86558)
         );
         assert_eq!(parse_size_from_key("WORM-s99-m100--name"), Some(99));
@@ -1343,9 +1354,11 @@ u2 something else timestamp=9s
         let found = find_annex_repos(&root);
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 2, "found {found:?}");
-        assert!(found
-            .iter()
-            .all(|p| p.ends_with("photos") || p.ends_with("docs")));
+        assert!(
+            found
+                .iter()
+                .all(|p| p.ends_with("photos") || p.ends_with("docs"))
+        );
     }
 
     #[test]
