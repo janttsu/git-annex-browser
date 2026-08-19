@@ -4,12 +4,12 @@ The browsable tree model for git-annex.
 Similar structure to zfs-browser: everything is a Node.
 */
 
-use crate::annex::{parse_size_from_key, AnnexMetadata, AnnexedFile, Remote, TrustLevel};
+use crate::annex::{
+    parse_size_from_key, AnnexMetadata, AnnexedFile, DriveProfile, Remote, TrustLevel,
+};
 use crate::util::{fmt_unix, human_bytes, short_uuid};
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader, Write};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::rc::Rc;
 
 pub trait Node {
@@ -36,6 +36,9 @@ pub trait Node {
     /// Whether this item (typically a drive) has setup that differs from other repos' same-named drive.
     fn anomalous(&self) -> bool {
         false
+    }
+    fn trust(&self) -> Option<TrustLevel> {
+        None
     }
 }
 
@@ -202,22 +205,18 @@ impl Node for RepoSummaryNode {
 
 /// Fully loaded repo. This is the interesting level.
 pub struct RepoNode {
-    pub meta: AnnexMetadata,
-    /// Profiles for detecting inconsistent drive setups across repos.
-    pub drive_profiles: std::collections::HashMap<String, crate::annex::DriveProfile>,
+    pub meta: Rc<AnnexMetadata>,
+    pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
 }
 
 impl RepoNode {
-    pub fn new(meta: AnnexMetadata) -> Self {
+    pub fn new(meta: Rc<AnnexMetadata>) -> Self {
         Self {
             meta,
-            drive_profiles: std::collections::HashMap::new(),
+            drive_profiles: Rc::new(HashMap::new()),
         }
     }
-    pub fn with_profiles(
-        mut self,
-        profiles: std::collections::HashMap<String, crate::annex::DriveProfile>,
-    ) -> Self {
+    pub fn with_profiles(mut self, profiles: Rc<HashMap<String, DriveProfile>>) -> Self {
         self.drive_profiles = profiles;
         self
     }
@@ -245,23 +244,23 @@ impl Node for RepoNode {
         // Lead with drives so you immediately see presence on all disks
         let mut kids: Vec<Rc<dyn Node>> = vec![
             Rc::new(DrivesNode {
-                meta: self.meta.clone(),
-                drive_profiles: self.drive_profiles.clone(),
+                meta: Rc::clone(&self.meta),
+                drive_profiles: Rc::clone(&self.drive_profiles),
             }),
             Rc::new(RepoInfoNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
             }),
         ];
         if !self.meta.files.is_empty() {
             kids.push(Rc::new(AllFilesNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 cached_children: std::cell::RefCell::new(None),
             }));
         }
         // Quick link to files present locally
         if self.meta.remotes.contains_key(&self.meta.uuid) {
             kids.push(Rc::new(FilesOnDriveNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 drive_uuid: self.meta.uuid.clone(),
                 drive_name: "here".to_string(),
                 cached_children: std::cell::RefCell::new(None),
@@ -292,7 +291,7 @@ impl Node for RepoNode {
 }
 
 pub struct RepoInfoNode {
-    pub meta: AnnexMetadata,
+    pub meta: Rc<AnnexMetadata>,
 }
 
 impl Node for RepoInfoNode {
@@ -374,9 +373,8 @@ impl Node for RepoInfoNode {
 
 /// List of all drives/remotes for the repo.
 pub struct DrivesNode {
-    pub meta: AnnexMetadata,
-    /// Drive profiles from across all repos (for anomaly detection). Cloned in for simplicity.
-    pub drive_profiles: std::collections::HashMap<String, crate::annex::DriveProfile>,
+    pub meta: Rc<AnnexMetadata>,
+    pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
 }
 
 impl Node for DrivesNode {
@@ -403,7 +401,7 @@ impl Node for DrivesNode {
                     false
                 };
                 Rc::new(DriveNode {
-                    meta: self.meta.clone(),
+                    meta: Rc::clone(&self.meta),
                     remote: r,
                     anomalous,
                 }) as Rc<dyn Node>
@@ -442,7 +440,7 @@ impl Node for DrivesNode {
                 .map(|r| r.name().to_string())
                 .collect();
             let mut missing_common: Vec<String> = vec![];
-            for (name, prof) in &self.drive_profiles {
+            for (name, prof) in self.drive_profiles.iter() {
                 if !my_names.contains(name) && prof.has_variation() {
                     // appears in multiple configs but not in this repo
                     if prof.trusts.values().sum::<usize>() >= 3 {
@@ -463,7 +461,7 @@ impl Node for DrivesNode {
 }
 
 pub struct DriveNode {
-    pub meta: AnnexMetadata,
+    pub meta: Rc<AnnexMetadata>,
     pub remote: Remote,
     pub anomalous: bool,
 }
@@ -481,7 +479,14 @@ impl Node for DriveNode {
         } else {
             "".into()
         };
-        format!("{}{}{} {} keys", r.name(), special, marker, r.present_count)
+        format!(
+            "{}{}{} {} {} keys",
+            r.name(),
+            special,
+            marker,
+            r.trust.short(),
+            r.present_count
+        )
     }
     fn kind(&self) -> &'static str {
         if self.remote.uuid == self.meta.uuid {
@@ -498,7 +503,7 @@ impl Node for DriveNode {
         })];
         if self.remote.present_count > 0 {
             kids.push(Rc::new(FilesOnDriveNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 drive_uuid: self.remote.uuid.clone(),
                 drive_name: self.remote.name().to_string(),
                 cached_children: std::cell::RefCell::new(None),
@@ -544,6 +549,9 @@ impl Node for DriveNode {
 
     fn anomalous(&self) -> bool {
         self.anomalous
+    }
+    fn trust(&self) -> Option<TrustLevel> {
+        Some(self.remote.trust)
     }
 }
 
@@ -616,7 +624,7 @@ impl Node for DriveInfoNode {
 
 /// Files present on a specific drive/remote (or here).
 pub struct FilesOnDriveNode {
-    pub meta: AnnexMetadata,
+    pub meta: Rc<AnnexMetadata>,
     pub drive_uuid: String,
     pub drive_name: String,
     cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,
@@ -641,93 +649,19 @@ impl Node for FilesOnDriveNode {
             return cached.clone();
         }
 
-        // Use git annex list --in=<drive> to get the current list of files
-        // present on this drive. This gives accurate "currently exists" data.
-        let remote_name = if self.drive_uuid == self.meta.uuid {
-            "here".to_string()
-        } else {
-            self.drive_name.clone()
-        };
-
-        let annexed_paths: Vec<String> = {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&self.meta.root)
-                .arg("annex")
-                .arg("list")
-                .arg(format!("--in={}", remote_name))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    // git annex list outputs a header + grid + "  path"
-                    // We take everything after the last "  " on each line.
-                    stdout
-                        .lines()
-                        .filter_map(|line| {
-                            if let Some(pos) = line.rfind("  ") {
-                                let p = line[pos + 2..].trim();
-                                if !p.is_empty() {
-                                    Some(p.to_string())
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    vec![]
-                }
-            } else {
-                vec![]
-            }
-        };
-
-        let mut drive_files: Vec<AnnexedFile> = vec![];
-        // Batch lookup keys for the paths present on this drive
-        if !annexed_paths.is_empty() {
-            let child = Command::new("git")
-                .arg("-C")
-                .arg(&self.meta.root)
-                .arg("annex")
-                .arg("lookupkey")
-                .arg("--batch")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Ok(mut child) = child {
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        for p in &annexed_paths {
-                            let _ = writeln!(stdin, "{}", p);
-                        }
-                    }
-                }
-                let stdout = child.stdout.take().unwrap();
-                let reader = BufReader::new(stdout);
-                for (i, line_res) in reader.lines().enumerate() {
-                    if let Ok(key) = line_res {
-                        if i < annexed_paths.len() {
-                            let path = annexed_paths[i].clone();
-                            let size = parse_size_from_key(&key);
-                            drive_files.push(AnnexedFile { path, key, size });
-                        }
-                    }
-                }
-                let _ = child.wait();
-            }
-        }
-
+        // Use cached location logs so offline drives stay browsable.
         let mut out = vec![];
-        // Build hierarchical: group by top level dir using the current list from list --in
         let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut direct_files: Vec<AnnexedFile> = vec![];
-        for f in &drive_files {
+        let mut current_keys: HashSet<String> = HashSet::new();
+        for f in &self.meta.files {
+            let Some(locs) = self.meta.locations.get(&f.key) else {
+                continue;
+            };
+            if !locs.contains(&self.drive_uuid) {
+                continue;
+            }
+            current_keys.insert(f.key.clone());
             if let Some(slash) = f.path.find('/') {
                 subdirs.insert(f.path[..slash].to_string());
             } else {
@@ -736,7 +670,7 @@ impl Node for FilesOnDriveNode {
         }
         for sd in subdirs {
             out.push(Rc::new(DirectoryNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 dir_path: sd,
                 drive_uuid: Some(self.drive_uuid.clone()),
                 cached_children: std::cell::RefCell::new(None),
@@ -744,14 +678,13 @@ impl Node for FilesOnDriveNode {
         }
         for f in direct_files {
             out.push(Rc::new(AnnexFileNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 file: f.clone(),
                 highlight_drive: Some(self.drive_uuid.clone()),
             }) as Rc<dyn Node>);
         }
 
         // Supplement with unused keys ... (add them as top level or under their dir, for simplicity as top)
-        let current_keys: HashSet<_> = drive_files.iter().map(|f| f.key.clone()).collect();
         for (key, locs) in &self.meta.locations {
             if locs.contains(&self.drive_uuid) && !current_keys.contains(key) {
                 let size = parse_size_from_key(key);
@@ -761,7 +694,7 @@ impl Node for FilesOnDriveNode {
                     size,
                 };
                 out.push(Rc::new(AnnexFileNode {
-                    meta: self.meta.clone(),
+                    meta: Rc::clone(&self.meta),
                     file: fake,
                     highlight_drive: Some(self.drive_uuid.clone()),
                 }) as Rc<dyn Node>);
@@ -788,7 +721,7 @@ impl Node for FilesOnDriveNode {
 
 /// A single annexed file. Details list all locations.
 pub struct AnnexFileNode {
-    pub meta: AnnexMetadata,
+    pub meta: Rc<AnnexMetadata>,
     pub file: AnnexedFile,
     pub highlight_drive: Option<String>,
 }
@@ -841,9 +774,6 @@ impl Node for AnnexFileNode {
             .get(&self.file.key)
             .cloned()
             .unwrap_or_default();
-        if let Some(h) = &self.highlight_drive {
-            locs.insert(h.clone());
-        }
         if locs.is_empty() {
             // Fallback to live query using git annex whereis (the user can see locations
             // with "git annex whereis", so we should too when the batch pre-load missed it).
@@ -893,7 +823,7 @@ impl Node for AnnexFileNode {
 
 /// Represents a directory in the annexed files tree.
 pub struct DirectoryNode {
-    meta: AnnexMetadata,
+    meta: Rc<AnnexMetadata>,
     dir_path: String, // e.g. "subdir/example" or "" for top
     // If set, only include files present on this drive (for per-drive tree views)
     drive_uuid: Option<String>,
@@ -958,7 +888,7 @@ impl Node for DirectoryNode {
                 format!("{}/{}", self.dir_path, sd)
             };
             kids.push(Rc::new(DirectoryNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 dir_path: sub_path,
                 drive_uuid: self.drive_uuid.clone(),
                 cached_children: std::cell::RefCell::new(None),
@@ -966,9 +896,9 @@ impl Node for DirectoryNode {
         }
         for f in direct_files {
             kids.push(Rc::new(AnnexFileNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 file: f,
-                highlight_drive: None,
+                highlight_drive: self.drive_uuid.clone(),
             }) as Rc<dyn Node>);
         }
         kids.sort_by_key(|k| {
@@ -992,7 +922,7 @@ impl Node for DirectoryNode {
 
 /// Flat list of ALL annexed files in working tree (with locations summary).
 pub struct AllFilesNode {
-    pub meta: AnnexMetadata,
+    pub meta: Rc<AnnexMetadata>,
     cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,
 }
 
@@ -1021,7 +951,7 @@ impl Node for AllFilesNode {
         let mut v: Vec<Rc<dyn Node>> = vec![];
         for sd in subdirs {
             v.push(Rc::new(DirectoryNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 dir_path: sd,
                 drive_uuid: None,
                 cached_children: std::cell::RefCell::new(None),
@@ -1029,7 +959,7 @@ impl Node for AllFilesNode {
         }
         for f in direct_files {
             v.push(Rc::new(AnnexFileNode {
-                meta: self.meta.clone(),
+                meta: Rc::clone(&self.meta),
                 file: f.clone(),
                 highlight_drive: None,
             }) as Rc<dyn Node>);

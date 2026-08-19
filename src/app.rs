@@ -24,7 +24,8 @@ pub enum Command {
     Back,
     Refresh,
     ToggleHelp,
-    ToggleRaw,   // like 'x' for raw log/details
+    ToggleRaw, // like 'x' for raw log/details
+    Select(usize),
     None,
 }
 
@@ -41,26 +42,29 @@ pub struct App {
     /// Last status message for UI.
     pub status: String,
     /// Preloaded full metadata for fast navigation (populated from cache + bg scan)
-    pub preloaded: HashMap<PathBuf, AnnexMetadata>,
+    pub preloaded: HashMap<PathBuf, Rc<AnnexMetadata>>,
     /// Lightweight summaries for instant root listing (from cache or computed)
     pub summaries: Vec<RepoSummary>,
     /// Paths we still want to (re)hydrate from disk in the background
     pub to_hydrate: Vec<PathBuf>,
     /// Profiles of drives by their name (e.g. "remote-foo") across all repos, for anomaly detection.
-    pub drive_profiles: HashMap<String, annex::DriveProfile>,
+    pub drive_profiles: Rc<HashMap<String, annex::DriveProfile>>,
 }
 
 impl App {
     pub fn new(scan_root: PathBuf) -> Self {
         let root = Rc::new(RootNode::new(scan_root.clone()));
         Self {
-            stack: vec![Level { node: root, selected: 0 }],
+            stack: vec![Level {
+                node: root,
+                selected: 0,
+            }],
             root_path: scan_root,
             status: "scanning for git annex repos...".into(),
             preloaded: HashMap::new(),
             summaries: vec![],
             to_hydrate: vec![],
-            drive_profiles: HashMap::new(),
+            drive_profiles: Rc::new(HashMap::new()),
         }
     }
 
@@ -75,11 +79,15 @@ impl App {
         let sel = level.selected.min(kids.len().saturating_sub(1));
         let selected_node = kids.get(sel).cloned();
 
-        let list_items: Vec<ListItem> = kids.iter().map(|n| ListItem {
-            label: n.label(),
-            kind: n.kind().to_string(),
-            anomalous: n.anomalous(),
-        }).collect();
+        let list_items: Vec<ListItem> = kids
+            .iter()
+            .map(|n| ListItem {
+                label: n.label(),
+                kind: n.kind().to_string(),
+                anomalous: n.anomalous(),
+                trust: n.trust(),
+            })
+            .collect();
 
         let details = if let Some(n) = &selected_node {
             n.details()
@@ -99,22 +107,37 @@ impl App {
             raw,
             status: self.status.clone(),
             total_repos: if let Some(r) = self.stack.first() {
-                r.node.children().iter().filter(|k| k.kind() != "report").count()
-            } else { 0 },
+                r.node
+                    .children()
+                    .iter()
+                    .filter(|k| k.kind() != "report")
+                    .count()
+            } else {
+                0
+            },
         }
     }
 
     pub fn execute(&mut self, cmd: Command, page: usize) -> Result<()> {
         match cmd {
             Command::None | Command::Quit | Command::ToggleHelp | Command::ToggleRaw => {}
+            Command::Select(i) => {
+                let l = self.current_level_mut();
+                let max = l.node.children().len().saturating_sub(1);
+                l.selected = i.min(max);
+            }
             Command::Up => {
                 let l = self.current_level_mut();
-                if l.selected > 0 { l.selected -= 1; }
+                if l.selected > 0 {
+                    l.selected -= 1;
+                }
             }
             Command::Down => {
                 let l = self.current_level_mut();
                 let max = l.node.children().len().saturating_sub(1);
-                if l.selected < max { l.selected += 1; }
+                if l.selected < max {
+                    l.selected += 1;
+                }
             }
             Command::PageUp => {
                 let l = self.current_level_mut();
@@ -127,7 +150,9 @@ impl App {
                 let page = page.max(1);
                 l.selected = (l.selected + page).min(kids_len.saturating_sub(1));
             }
-            Command::Top => { self.current_level_mut().selected = 0; }
+            Command::Top => {
+                self.current_level_mut().selected = 0;
+            }
             Command::Bottom => {
                 let l = self.current_level_mut();
                 l.selected = l.node.children().len().saturating_sub(1);
@@ -144,17 +169,25 @@ impl App {
                     if let Some(p) = child.annex_repo_path() {
                         if let Some(meta) = self.preloaded.get(p).cloned() {
                             // Instant because of bg pre-scan or cache
-                            let profiles = self.drive_profiles.clone();
+                            let profiles = Rc::clone(&self.drive_profiles);
                             let node = Rc::new(RepoNode::new(meta).with_profiles(profiles));
                             self.stack.push(Level { node, selected: 0 });
                             self.status = "preloaded".into();
                         } else {
                             self.status = format!("loading {} ...", p.display());
-                            let loading = Rc::new(RepoLoadingNode { path: p.to_path_buf() });
-                            self.stack.push(Level { node: loading, selected: 0 });
+                            let loading = Rc::new(RepoLoadingNode {
+                                path: p.to_path_buf(),
+                            });
+                            self.stack.push(Level {
+                                node: loading,
+                                selected: 0,
+                            });
                         }
                     } else {
-                        self.stack.push(Level { node: Rc::clone(child), selected: 0 });
+                        self.stack.push(Level {
+                            node: Rc::clone(child),
+                            selected: 0,
+                        });
                     }
                 }
             }
@@ -183,11 +216,17 @@ impl App {
     /// Called from worker after a successful full repo load.
     /// Replaces the top loading node with the real RepoNode.
     pub fn install_loaded_repo(&mut self, meta: AnnexMetadata) {
-        if self.stack.last().map_or(false, |l| l.node.loading_path().is_some()) {
+        if self
+            .stack
+            .last()
+            .map_or(false, |l| l.node.loading_path().is_some())
+        {
             self.stack.pop();
         }
-        self.ingest_meta(meta.clone());
-        let profiles = self.drive_profiles.clone();
+        let root = meta.root.clone();
+        self.ingest_meta(meta);
+        let meta = Rc::clone(self.preloaded.get(&root).expect("metadata just ingested"));
+        let profiles = Rc::clone(&self.drive_profiles);
         let node = Rc::new(RepoNode::new(meta).with_profiles(profiles));
         self.stack.push(Level { node, selected: 0 });
         self.status = "loaded".into();
@@ -198,23 +237,30 @@ impl App {
     pub fn set_discovered(&mut self, repos: Vec<PathBuf>) {
         // If we have cached summaries, use them; otherwise create minimal ones from paths
         if self.summaries.is_empty() {
-            self.summaries = repos.iter().map(|p| {
-                let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                let mut s = RepoSummary {
-                    root: p.clone(),
-                    uuid: String::new(),
-                    name,
-                    annex_description: String::new(),
-                    file_count: 0,
-                    remote_count: 0,
-                    here_present_count: 0,
-                    here_available_space: None,
-                    unique_size: 0,
-                    consumed_size: 0,
-                };
-                s.ensure_name();
-                s
-            }).collect();
+            self.summaries = repos
+                .iter()
+                .map(|p| {
+                    let name = p
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let mut s = RepoSummary {
+                        root: p.clone(),
+                        uuid: String::new(),
+                        name,
+                        annex_description: String::new(),
+                        file_count: 0,
+                        remote_count: 0,
+                        here_present_count: 0,
+                        here_available_space: None,
+                        unique_size: 0,
+                        consumed_size: 0,
+                    };
+                    s.ensure_name();
+                    s
+                })
+                .collect();
         }
         if let Some(lvl) = self.stack.first_mut() {
             let mut new_root = crate::node::RootNode::new(self.root_path.clone());
@@ -222,7 +268,11 @@ impl App {
             lvl.node = Rc::new(new_root);
             lvl.selected = 0;
         }
-        self.status = format!("found {} annex repos ({} cached)", repos.len(), self.preloaded.len());
+        self.status = format!(
+            "found {} annex repos ({} cached)",
+            repos.len(),
+            self.preloaded.len()
+        );
     }
 
     pub fn apply_summary(&mut self, mut s: RepoSummary) {
@@ -239,7 +289,7 @@ impl App {
     pub fn ingest_meta(&mut self, mut meta: AnnexMetadata) {
         meta.ensure_sizes();
         let sum = meta.to_summary();
-        self.preloaded.insert(meta.root.clone(), meta);
+        self.preloaded.insert(meta.root.clone(), Rc::new(meta));
         self.apply_summary(sum);
         self.recompute_drive_profiles();
     }
@@ -261,7 +311,7 @@ impl App {
                 *p.requireds.entry(r.required.clone()).or_default() += 1;
             }
         }
-        self.drive_profiles = profiles;
+        self.drive_profiles = Rc::new(profiles);
     }
 
     /// Rebuild/replace the root level node using the current summaries (no downcast).
@@ -294,12 +344,9 @@ pub struct ListItem {
     pub kind: String,
     /// True if this drive/repo setup differs from the common setup for drives/repos with the same name/folder.
     pub anomalous: bool,
+    pub trust: Option<crate::annex::TrustLevel>,
 }
 
 // Small helper for downcasting Rc<dyn Node> (simple since Rust 1.0 no built-in, use a tiny trick or Any).
-// We use a manual approach with type ids or just match in app. For simplicity here we added a helper in node? 
+// We use a manual approach with type ids or just match in app. For simplicity here we added a helper in node?
 // Since we control all types, in practice the descend logic above uses concrete check before push.
-
-impl RootNode {
-    // helper
-}
