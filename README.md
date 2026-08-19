@@ -13,33 +13,39 @@ All this information is available via normal `git annex` commands, but querying 
 
 **Binary name:** `git-annex-browser`
 
-Pure data access via the git repo and git-annex plumbing / branch logs where possible.
+Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, and so on) plus `git annex whereis --json --all` / `git annex find`. The TUI itself is view-only.
 
 ## Features
-- Recursive discovery of all annex repos under the given root dir.
+- Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees).
 - Per-repo view of:
   - Summary (uuid, counts, trust breakdown, last fsck)
-  - **Drives / remotes** list with type, trust (color hints via symbols T?UD), present key counts, last fsck
-  - Files present on a specific drive (including here)
+  - **Drives / remotes** list with type, trust (`T`/`?`/`U`/`D`, colored), present key counts, last fsck
+  - Files present on a specific drive (including here), from cached location data so offline drives stay browsable
   - All annexed files in the working tree, each annotated with short presence badges
-- For each file: full list of locations (which UUIDs / names currently have the content) + key + size
-- Location data comes from authoritative `git annex whereis --json --all` + git-annex branch logs
-- `--scan` caches the data so that browsing the overall state of many (often offline) drives is fast and convenient in the UI.
+- For each file: locations (trusted and untrusted copies) + key + size
+- `--scan` caches the data so browsing many (often offline) drives is fast in the UI
 - Keyboard-driven tree navigation like zfs-browser
+- `/` filters the current list
 
 ## Usage
 ```
-git-annex-browser [DIR]
+git-annex-browser [OPTIONS] [DIR]
 ```
 
-`DIR` defaults to the current directory (`.`).
+`DIR` defaults to `.` (current directory). Only annexes under that directory are shown; the on-disk cache still keeps repos from other roots.
 
-- `DIR` defaults to `.` (current directory)
-- Descend into a repo → drives → see files on that drive
-- `r` to re-scan from disk
-- `--scan` to cache the current state so you can browse it quickly and clearly in the UI (useful for cron)
+| Flag | Meaning |
+|---|---|
+| `--scan` | Discover annexes under `DIR`, load metadata, merge into the cache, then exit (no TUI). Useful from cron. |
+| `--quiet` | With `--scan`, suppress progress. |
+| `--dump` | Print a text summary (no TUI) and merge the result into the cache. |
+| `--tick-ms <N>` | UI poll interval in milliseconds (clamped 10–1000, default 100). |
 
-Keys (similar to zfs-browser):
+`--scan` and `--dump` **merge** into the cache: repos under `DIR` are updated or removed if they disappeared; cached repos outside `DIR` are left alone.
+
+Descend into a repo → drives → files on that drive. `r` / `F5` re-scans from disk.
+
+Keys:
 ```
 ↑ / k          up
 ↓ / j          down
@@ -48,15 +54,22 @@ Shift+PgUp/Dn  scroll details pane
 g / G          top / bottom
 → / Enter / l  descend
 ← / h / Back   back
+/              filter current list (Enter to keep, Esc to clear)
 r / F5         refresh / re-scan
 x              toggle raw view (locations / logs for selection)
 ? / F1         help
-q              quit
+q / Esc        quit
 ```
+
+## Cache
+
+Default path: `$XDG_CACHE_HOME/git-annex-browser/cache.json`, or `~/.cache/git-annex-browser/cache.json`.
+
+Override with `GIT_ANNEX_BROWSER_CACHE`. The file is compact JSON, mode `0600`, written under a lock. Special-remote `cipher` values are redacted.
 
 ## Requirements
 - git + git-annex installed
-- A Rust toolchain (for building from source)
+- A Rust toolchain (for building from source). Edition 2024, so a recent stable rustc.
 
 ## Installation
 
@@ -81,10 +94,20 @@ Then run:
 git-annex-browser /path/with/annexes
 ```
 
-## Future Ideas
-- Works great for personal collections of annexes on multiple drives (the original use case).
-- For very large annexes (>50k files) the file lists are still loaded fully when you enter "all files" or a drive's file list; drive-specific filtered views are the recommended way.
-- No write support yet (view only). Adding `git annex trust` / copy hints etc is possible behind an opt-in flag.
-- Additional creative polish possible: coverage %, risk files (present only on untrusted), global dedup view across multiple repos, etc.
+Cron-style cache refresh:
 
-Licensed under MIT OR Apache-2.0.
+```sh
+git-annex-browser --scan --quiet /path/with/annexes
+```
+
+## Notes
+- View only: no `git annex get` / `drop` / `trust`.
+- Nested annexes inside another annex working tree are not discovered (the parent annex is a prune point).
+- Very large annexes (>50k files) still materialize the file tree when you open "all files" or a drive's file list; prefer drive-specific views and `/` filter.
+- Drive file lists use cached `whereis` data, not a live `git annex list`.
+
+## Future Ideas
+- Opt-in write support (`git annex trust`, copy hints).
+- Coverage %, risk files (present only on untrusted), global dedup view across multiple repos.
+
+Licensed under MIT OR Apache-2.0. See [LICENSE](LICENSE) and [LICENSE-APACHE](LICENSE-APACHE).
