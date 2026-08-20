@@ -40,6 +40,10 @@ pub trait Node {
     fn trust(&self) -> Option<TrustLevel> {
         None
     }
+    /// Fully loaded repo node for this annex path (not the summary placeholder).
+    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Top level: discovered repos under the scan dir.
@@ -269,6 +273,9 @@ impl Node for RepoNode {
     }
     fn kind(&self) -> &'static str {
         "repo"
+    }
+    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+        Some(&self.meta.root)
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         // Lead with drives so you immediately see presence on all disks

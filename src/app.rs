@@ -49,6 +49,8 @@ pub struct App {
     pub to_hydrate: Vec<PathBuf>,
     /// Profiles of drives by their name (e.g. "remote-foo") across all repos, for anomaly detection.
     pub drive_profiles: Rc<HashMap<String, annex::DriveProfile>>,
+    /// Background scan still running (hydrate queue or in-flight loads).
+    pub scanning: bool,
 }
 
 impl App {
@@ -65,6 +67,7 @@ impl App {
             summaries: vec![],
             to_hydrate: vec![],
             drive_profiles: Rc::new(HashMap::new()),
+            scanning: false,
         }
     }
 
@@ -115,6 +118,7 @@ impl App {
             } else {
                 0
             },
+            scanning: self.scanning,
         }
     }
 
@@ -263,12 +267,7 @@ impl App {
                 })
                 .collect();
         }
-        if let Some(lvl) = self.stack.first_mut() {
-            let mut new_root = crate::node::RootNode::new(self.root_path.clone());
-            new_root.summaries = self.summaries.clone();
-            lvl.node = Rc::new(new_root);
-            lvl.selected = 0;
-        }
+        self.refresh_root_view();
         self.status = format!(
             "found {} annex repos ({} cached)",
             repos.len(),
@@ -290,9 +289,11 @@ impl App {
     pub fn ingest_meta(&mut self, mut meta: AnnexMetadata) {
         meta.ensure_sizes();
         let sum = meta.to_summary();
-        self.preloaded.insert(meta.root.clone(), Rc::new(meta));
+        let root = meta.root.clone();
+        self.preloaded.insert(root.clone(), Rc::new(meta));
         self.apply_summary(sum);
         self.recompute_drive_profiles();
+        self.replace_open_repo(&root);
     }
 
     /// Recompute drive name -> profile map from all preloaded metas.
@@ -317,12 +318,58 @@ impl App {
 
     /// Rebuild/replace the root level node using the current summaries (no downcast).
     pub fn refresh_root_view(&mut self) {
-        if self.stack.len() == 1 {
-            let mut new_root = RootNode::new(self.root_path.clone());
-            new_root.summaries = self.summaries.clone();
-            if let Some(lvl) = self.stack.first_mut() {
-                lvl.node = Rc::new(new_root);
+        let prev = self.stack.first().map(|l| l.selected).unwrap_or(0);
+        let mut new_root = RootNode::new(self.root_path.clone());
+        new_root.summaries = self.summaries.clone();
+        if let Some(lvl) = self.stack.first_mut() {
+            lvl.node = Rc::new(new_root);
+            let max = lvl.node.children().len().saturating_sub(1);
+            lvl.selected = prev.min(max);
+        }
+        if self.stack.len() >= 2 && self.stack[1].node.kind() == "report" {
+            let kids = self.stack[0].node.children();
+            if let Some(report) = kids.iter().find(|n| n.kind() == "report") {
+                let sel = self.stack[1].selected;
+                self.stack[1].node = Rc::clone(report);
+                self.stack[1].selected = sel;
             }
+        }
+    }
+
+    /// If the user is inside a repo that was just re-scanned, rebuild that subtree.
+    pub fn replace_open_repo(&mut self, root: &std::path::Path) {
+        let Some(pos) = self
+            .stack
+            .iter()
+            .position(|l| l.node.loaded_repo_path() == Some(root))
+        else {
+            return;
+        };
+        let selections: Vec<usize> = self.stack[pos..].iter().map(|l| l.selected).collect();
+        self.stack.truncate(pos);
+        let Some(meta) = self.preloaded.get(root).cloned() else {
+            return;
+        };
+        let node = Rc::new(RepoNode::new(meta).with_profiles(Rc::clone(&self.drive_profiles)));
+        let first_sel = selections.first().copied().unwrap_or(0);
+        self.stack.push(Level {
+            node,
+            selected: first_sel,
+        });
+        for i in 0..selections.len().saturating_sub(1) {
+            let kids = self.stack.last().unwrap().node.children();
+            if kids.is_empty() {
+                break;
+            }
+            let sel = self.stack.last().unwrap().selected.min(kids.len() - 1);
+            self.stack.last_mut().unwrap().selected = sel;
+            let child = Rc::clone(&kids[sel]);
+            let child_sel = selections.get(i + 1).copied().unwrap_or(0);
+            let child_sel = child_sel.min(child.children().len().saturating_sub(1));
+            self.stack.push(Level {
+                node: child,
+                selected: child_sel,
+            });
         }
     }
 }
@@ -337,6 +384,7 @@ pub struct ViewSnapshot {
     pub raw: Option<String>,
     pub status: String,
     pub total_repos: usize,
+    pub scanning: bool,
 }
 
 #[derive(Debug, Clone)]

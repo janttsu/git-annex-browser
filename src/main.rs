@@ -270,16 +270,7 @@ fn main() -> Result<()> {
                     snapshot = Some(s);
                 }
                 WorkerOut::Background(s) => {
-                    if pending == 0 {
-                        let same = snapshot
-                            .as_ref()
-                            .map(|o| o.crumb == s.crumb && o.selected == s.selected)
-                            .unwrap_or(false);
-                        if !same {
-                            detail_scroll = 0;
-                        }
-                        snapshot = Some(s);
-                    }
+                    apply_background_snapshot(&mut snapshot, s, pending, &mut detail_scroll);
                 }
             }
         }
@@ -288,7 +279,7 @@ fn main() -> Result<()> {
             tui::draw(
                 frame,
                 snapshot.as_ref(),
-                pending > 0,
+                pending > 0 || snapshot.as_ref().is_some_and(|s| s.scanning),
                 show_help,
                 show_raw,
                 detail_scroll,
@@ -409,6 +400,40 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn apply_background_snapshot(
+    snapshot: &mut Option<ViewSnapshot>,
+    incoming: ViewSnapshot,
+    pending: usize,
+    detail_scroll: &mut usize,
+) {
+    if pending > 0
+        && let Some(cur) = snapshot.as_mut()
+    {
+        if cur.crumb == incoming.crumb {
+            let sel = cur.selected.min(incoming.list.len().saturating_sub(1));
+            let selected_matches = sel == incoming.selected;
+            cur.list = incoming.list;
+            cur.status = incoming.status;
+            cur.total_repos = incoming.total_repos;
+            cur.scanning = incoming.scanning;
+            cur.selected = sel;
+            if selected_matches {
+                cur.details = incoming.details;
+                cur.raw = incoming.raw;
+            }
+        }
+        return;
+    }
+    let same = snapshot
+        .as_ref()
+        .map(|o| o.crumb == incoming.crumb && o.selected == incoming.selected)
+        .unwrap_or(false);
+    if !same {
+        *detail_scroll = 0;
+    }
+    *snapshot = Some(incoming);
 }
 
 fn request_quit(cancel: &Arc<AtomicBool>, cmd_tx: &std::sync::mpsc::Sender<WorkerMsg>) {

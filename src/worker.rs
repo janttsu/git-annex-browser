@@ -58,16 +58,27 @@ pub fn spawn(
                 worker.app.summaries.push(sum);
             }
             worker.app.status = format!(
-                "loaded {} from cache — scanning…",
+                "loaded {} from cache — discovering…",
                 worker.app.preloaded.len()
             );
             worker.app.recompute_drive_profiles();
+            worker.app.refresh_root_view();
+            worker.app.scanning = true;
+            let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
         }
 
-        // 2. On-disk discovery (always)
+        // 2. On-disk discovery (always). Cache snapshot already went to the UI.
         let discovered = annex::find_annex_repos(&scan_root);
 
-        // Seed any missing summaries from discovery (for repos not in cache)
+        worker
+            .app
+            .summaries
+            .retain(|s| discovered.iter().any(|p| p == &s.root));
+        worker
+            .app
+            .preloaded
+            .retain(|p, _| discovered.iter().any(|d| d == p));
+
         for p in &discovered {
             if !worker.app.summaries.iter().any(|s| &s.root == p) {
                 let name = p
@@ -91,23 +102,12 @@ pub fn spawn(
                 sum.ensure_name();
                 worker.app.summaries.push(sum);
             }
-            // Always (re)hydrate everything in background on open
-            if !worker.app.preloaded.contains_key(p) {
-                worker.app.to_hydrate.push(p.clone());
-            }
         }
 
-        // Only re-hydrate things not already in cache for faster startup.
-        // Explicit refresh will re-scan.
-        for p in &discovered {
-            if !worker.app.preloaded.contains_key(p)
-                && !worker.app.to_hydrate.iter().any(|x| x == p)
-            {
-                worker.app.to_hydrate.push(p.clone());
-            }
-        }
-
+        queue_hydrate(&mut worker.app, &discovered);
+        let mut hydrate_total = worker.app.to_hydrate.len();
         worker.app.set_discovered(discovered.clone());
+        mark_scan_progress(&mut worker.app, 0, hydrate_total);
         let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
 
         // 3. Background hydration loop + cache updates
@@ -125,29 +125,25 @@ pub fn spawn(
             while let Ok((p, res)) = meta_rx.try_recv() {
                 in_flight = in_flight.saturating_sub(1);
                 match res {
-                    Ok(mut meta) => {
-                        meta.ensure_sizes();
-                        let mut sum = meta.to_summary();
-                        sum.ensure_name();
-                        worker.app.preloaded.insert(p.clone(), Rc::new(meta));
-                        if let Some(existing) =
-                            worker.app.summaries.iter_mut().find(|s| s.root == p)
-                        {
-                            *existing = sum;
-                        } else {
-                            worker.app.summaries.push(sum);
-                        }
-                        worker.app.recompute_drive_profiles();
-                        worker.app.refresh_root_view();
+                    Ok(meta) => {
+                        worker.app.ingest_meta(meta);
                         dirty = true;
-                        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
-                        if last_save.elapsed() > Duration::from_secs(4) {
+                        mark_scan_progress(&mut worker.app, in_flight, hydrate_total);
+                        if !worker.app.scanning {
+                            worker.app.status =
+                                format!("{} repos • cache updated", worker.app.preloaded.len());
+                            persist_scan(&worker.app, &scan_root);
+                            last_save = std::time::Instant::now();
+                            dirty = false;
+                        } else if last_save.elapsed() > Duration::from_secs(4) {
                             persist_preloaded(&worker.app);
                             last_save = std::time::Instant::now();
                             dirty = false;
                         }
+                        let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
                     }
                     Err(e) => {
+                        mark_scan_progress(&mut worker.app, in_flight, hydrate_total);
                         worker.app.status = format!("failed {}: {}", p.display(), e);
                         let _ = snap_tx.send(WorkerOut::Background(worker.app.snapshot(20)));
                     }
@@ -170,8 +166,13 @@ pub fn spawn(
                             let _ = meta_tx.send((p, res));
                         });
                     }
-                    if in_flight == 0 && dirty && last_save.elapsed() > Duration::from_secs(2) {
-                        persist_preloaded(&worker.app);
+                    mark_scan_progress(&mut worker.app, in_flight, hydrate_total);
+                    if in_flight == 0
+                        && !worker.app.scanning
+                        && dirty
+                        && last_save.elapsed() > Duration::from_secs(2)
+                    {
+                        persist_scan(&worker.app, &scan_root);
                         last_save = std::time::Instant::now();
                         dirty = false;
                         worker.app.status =
@@ -193,9 +194,19 @@ pub fn spawn(
                     }
                     if cmd == Command::Refresh {
                         let repos = annex::find_annex_repos(&scan_root);
-                        worker.app.to_hydrate = repos.clone();
+                        worker
+                            .app
+                            .summaries
+                            .retain(|s| repos.iter().any(|p| p == &s.root));
+                        worker
+                            .app
+                            .preloaded
+                            .retain(|p, _| repos.iter().any(|d| d == p));
+                        queue_hydrate(&mut worker.app, &repos);
+                        hydrate_total = worker.app.to_hydrate.len() + in_flight;
                         worker.app.set_discovered(repos);
                         worker.app.recompute_drive_profiles();
+                        mark_scan_progress(&mut worker.app, in_flight, hydrate_total);
                         while worker.app.stack.len() > 1 {
                             worker.app.stack.pop();
                         }
@@ -239,4 +250,43 @@ fn persist_preloaded(app: &App) {
         .map(|(k, v)| (k.to_string_lossy().to_string(), v.as_ref().clone()))
         .collect::<Vec<_>>();
     let _ = annex::upsert_cache_repos(repos);
+}
+
+fn persist_scan(app: &App, scan_root: &std::path::Path) {
+    let repos = app
+        .preloaded
+        .iter()
+        .filter(|(k, _)| annex::path_is_under(k, scan_root))
+        .map(|(k, v)| (k.to_string_lossy().to_string(), v.as_ref().clone()))
+        .collect();
+    let _ = annex::merge_scan_into_cache(scan_root, repos);
+}
+
+/// Uncached repos first (pop from the end), then refresh already-cached ones.
+fn queue_hydrate(app: &mut App, discovered: &[PathBuf]) {
+    let mut cached = Vec::new();
+    let mut fresh = Vec::new();
+    for p in discovered {
+        if app.preloaded.contains_key(p) {
+            cached.push(p.clone());
+        } else {
+            fresh.push(p.clone());
+        }
+    }
+    app.to_hydrate.clear();
+    app.to_hydrate.extend(cached);
+    app.to_hydrate.extend(fresh);
+}
+
+fn mark_scan_progress(app: &mut App, in_flight: usize, total: usize) {
+    let remaining = app.to_hydrate.len() + in_flight;
+    app.scanning = remaining > 0;
+    if total == 0 {
+        app.scanning = false;
+        return;
+    }
+    if remaining > 0 {
+        let done = total.saturating_sub(remaining).min(total);
+        app.status = format!("scanning {done}/{total}…");
+    }
 }
