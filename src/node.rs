@@ -79,7 +79,7 @@ impl Node for RootNode {
         vec![
             format!("root: {}", self.scan_root.display()),
             format!("annex repos found: {}", self.summaries.len()),
-            "The first item in the list is '📊 Global report (all repos)' — select it for totals across everything.".into(),
+            "The first item in the list is 'Global report (all repos)' — select it for totals across everything.".into(),
             "Use --scan to refresh cache.".into(),
         ]
     }
@@ -104,16 +104,22 @@ impl Node for GlobalReportNode {
     fn details(&self) -> Vec<String> {
         let num_repos = self.summaries.len();
         let total_files: usize = self.summaries.iter().map(|s| s.file_count).sum();
-        let total_remotes: usize = self.summaries.iter().map(|s| s.remote_count).sum();
         let total_here: usize = self.summaries.iter().map(|s| s.here_present_count).sum();
         let total_unique: u64 = self.summaries.iter().map(|s| s.unique_size).sum();
         let total_consumed: u64 = self.summaries.iter().map(|s| s.consumed_size).sum();
+        let per_remote = crate::annex::aggregate_remote_usage(&self.summaries);
+        let (unique_remotes, summed_remotes) = crate::annex::remote_name_stats(&self.summaries);
+        let remotes_line = if unique_remotes > 0 {
+            format!("{unique_remotes} unique remotes ({summed_remotes} across {num_repos} repos)")
+        } else {
+            format!("Remotes/drives: {summed_remotes}")
+        };
 
-        vec![
+        let mut rows = vec![
             "GLOBAL REPORT — totals across ALL repos".into(),
             format!("Repos: {}", num_repos),
             format!("Working tree files: {}", total_files),
-            format!("Remotes/drives: {}", total_remotes),
+            remotes_line,
             format!("Keys present here (across repos): {}", total_here),
             format!(
                 "Unique data size (1 copy each): {}",
@@ -123,8 +129,32 @@ impl Node for GlobalReportNode {
                 "Total storage used across drives (with copies): {}",
                 human_bytes(total_consumed)
             ),
-            "Select a repo below to browse its drives/files.".into(),
-        ]
+        ];
+        let has_usage = self.summaries.iter().any(|s| !s.remote_usage.is_empty());
+        if !has_usage {
+            rows.push("Storage per remote: (re-scan or wait for cache hydrate)".into());
+        } else if per_remote.is_empty() {
+            rows.push("No special remotes (rclone etc.) with stored content.".into());
+        } else {
+            rows.push("".into());
+            rows.push("Storage per special remote (rclone etc.):".into());
+            for (name, bytes, keys, repos) in per_remote {
+                let repo_note = if repos == 1 {
+                    "1 repo".to_string()
+                } else {
+                    format!("{repos} repos")
+                };
+                rows.push(format!(
+                    "  {} : {}  ({} keys, {})",
+                    name,
+                    human_bytes(bytes),
+                    keys,
+                    repo_note
+                ));
+            }
+        }
+        rows.push("Select a repo below to browse its drives/files.".into());
+        rows
     }
 }
 
@@ -479,13 +509,19 @@ impl Node for DriveNode {
         } else {
             "".into()
         };
+        let sz = if r.present_size > 0 {
+            format!(" {}", human_bytes(r.present_size))
+        } else {
+            String::new()
+        };
         format!(
-            "{}{}{} {} {} keys",
+            "{}{}{} {} {} keys{}",
             r.name(),
             special,
             marker,
             r.trust.short(),
-            r.present_count
+            r.present_count,
+            sz
         )
     }
     fn kind(&self) -> &'static str {
@@ -519,6 +555,7 @@ impl Node for DriveNode {
             format!("type: {}", r.rtype()),
             format!("trust: {} ({})", r.trust.as_str(), r.trust.short()),
             format!("present keys: {}", r.present_count),
+            format!("present size: {}", human_bytes(r.present_size)),
         ];
         if let Some(ts) = r.last_fsck {
             d.push(format!("last fsck: {}", fmt_unix(ts)));
@@ -606,6 +643,10 @@ impl Node for DriveInfoNode {
             rows.push(format!("Last fsck recorded: {}", fmt_unix(ts)));
         }
         rows.push(format!("Keys present on this: {}", r.present_count));
+        rows.push(format!(
+            "Storage used on this: {}",
+            human_bytes(r.present_size)
+        ));
         if !r.groups.is_empty() {
             rows.push(format!("groups: {}", r.groups.join(", ")));
         }
