@@ -24,6 +24,7 @@ Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group
   - All annexed files in the working tree, each annotated with short presence badges
 - For each file: locations (trusted and untrusted copies) + key + size
 - `--scan` caches the data so browsing many (often offline) drives is fast in the UI
+- Global report includes unique vs total-with-copies size, plus storage per special remote (rclone etc.; other annex clones are omitted)
 - Keyboard-driven tree navigation like zfs-browser
 - `/` filters the current list
 

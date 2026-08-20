@@ -59,6 +59,9 @@ pub struct Remote {
     pub last_fsck: Option<i64>, // unix timestamp
     /// Number of keys present according to location logs (computed)
     pub present_count: usize,
+    /// Sum of those keys' sizes (from key names when available)
+    #[serde(default)]
+    pub present_size: u64,
     /// Filesystem free bytes for this drive (if we could determine a local path for it)
     /// Note: no longer displayed by default as it's not git-annex metadata.
     #[serde(default)]
@@ -86,6 +89,30 @@ impl Remote {
     }
     pub fn is_special(&self) -> bool {
         self.config.contains_key("type")
+    }
+
+    /// Cloud/external special remotes (rclone, s3, …). Other annex clones and
+    /// `directory` remotes are local storage, not listed in "storage per remote".
+    pub fn is_transfer_remote(&self) -> bool {
+        match self.config.get("type").map(|s| s.as_str()) {
+            None | Some("directory") => false,
+            Some(_) => true,
+        }
+    }
+
+    /// Human type for transfer remotes: `rclone` if externaltype is set, else `type`.
+    pub fn transfer_kind(&self) -> Option<String> {
+        if !self.is_transfer_remote() {
+            return None;
+        }
+        let t = self.config.get("type")?;
+        if t == "external"
+            && let Some(ext) = self.config.get("externaltype")
+            && !ext.is_empty()
+        {
+            return Some(ext.clone());
+        }
+        Some(t.clone())
     }
 }
 
@@ -146,6 +173,33 @@ pub struct RepoSummary {
     /// Total space used across all drives (with duplicates counted per copy)
     #[serde(default)]
     pub consumed_size: u64,
+    /// Per-remote occupancy, for the global report (name is the grouping key).
+    #[serde(default)]
+    pub remote_usage: Vec<RemoteUsage>,
+}
+
+/// One remote's stored keys/bytes inside a single annex.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteUsage {
+    pub name: String,
+    #[serde(default)]
+    pub uuid: String,
+    #[serde(default)]
+    pub present_count: usize,
+    #[serde(default)]
+    pub present_size: u64,
+    /// Special-remote type (`rclone`, `s3`, `external`, …). None for other annex clones.
+    #[serde(default)]
+    pub special_type: Option<String>,
+}
+
+impl RemoteUsage {
+    pub fn is_transfer_remote(&self) -> bool {
+        match self.special_type.as_deref() {
+            None | Some("directory") => false,
+            Some(_) => true,
+        }
+    }
 }
 
 impl AnnexMetadata {
@@ -171,25 +225,33 @@ impl AnnexMetadata {
             here_available_space: None, // no longer populated
             unique_size: self.unique_size,
             consumed_size: self.consumed_size,
+            remote_usage: self
+                .remotes
+                .values()
+                .map(|r| RemoteUsage {
+                    name: r.name().to_string(),
+                    uuid: r.uuid.clone(),
+                    present_count: r.present_count,
+                    present_size: r.present_size,
+                    special_type: r.transfer_kind(),
+                })
+                .collect(),
         }
     }
 
     /// Ensure size stats are populated (for old caches that didn't have them)
     pub fn ensure_sizes(&mut self) {
-        if self.unique_size == 0 && self.consumed_size == 0 && !self.locations.is_empty() {
-            let mut key_sizes: HashMap<String, u64> = HashMap::new();
-            for f in &self.files {
-                if let Some(sz) = f.size {
-                    key_sizes.insert(f.key.clone(), sz);
-                }
-            }
-            for key in self.locations.keys() {
-                if !key_sizes.contains_key(key)
-                    && let Some(sz) = parse_size_from_key(key)
-                {
-                    key_sizes.insert(key.clone(), sz);
-                }
-            }
+        let need_totals =
+            self.unique_size == 0 && self.consumed_size == 0 && !self.locations.is_empty();
+        let need_remote = self
+            .remotes
+            .values()
+            .any(|r| r.present_count > 0 && r.present_size == 0);
+        if !need_totals && !need_remote {
+            return;
+        }
+        let key_sizes = collect_key_sizes(&self.files, &self.locations);
+        if need_totals {
             let mut u = 0u64;
             let mut c = 0u64;
             for (key, uuids) in &self.locations {
@@ -201,7 +263,57 @@ impl AnnexMetadata {
             self.unique_size = u;
             self.consumed_size = c;
         }
+        if need_remote {
+            apply_present_stats(&mut self.remotes, &self.locations, &key_sizes);
+        }
     }
+}
+
+/// Aggregate occupancy by remote name across many repos (same drive in several annexes).
+/// Returns (name, bytes, keys, repo_count) sorted by bytes descending.
+pub fn aggregate_remote_usage(summaries: &[RepoSummary]) -> Vec<(String, u64, usize, usize)> {
+    let mut by_name: HashMap<String, (u64, usize, usize)> = HashMap::new();
+    for s in summaries {
+        for u in &s.remote_usage {
+            if !u.is_transfer_remote() {
+                continue;
+            }
+            if u.present_count == 0 && u.present_size == 0 {
+                continue;
+            }
+            let label = match u.special_type.as_deref() {
+                Some(kind) => format!("{} ({kind})", u.name),
+                None => u.name.clone(),
+            };
+            let e = by_name.entry(label).or_insert((0, 0, 0));
+            e.0 += u.present_size;
+            e.1 += u.present_count;
+            e.2 += 1;
+        }
+    }
+    let mut rows: Vec<_> = by_name
+        .into_iter()
+        .map(|(name, (bytes, keys, repos))| (name, bytes, keys, repos))
+        .collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
+/// Unique remote names vs summed per-repo remote entries.
+pub fn remote_name_stats(summaries: &[RepoSummary]) -> (usize, usize) {
+    let mut names = HashSet::new();
+    let mut summed = 0usize;
+    for s in summaries {
+        if s.remote_usage.is_empty() {
+            summed += s.remote_count;
+        } else {
+            summed += s.remote_usage.len();
+            for u in &s.remote_usage {
+                names.insert(u.name.as_str());
+            }
+        }
+    }
+    (names.len(), summed)
 }
 
 impl RepoSummary {
@@ -537,6 +649,46 @@ pub fn parse_size_from_key(key: &str) -> Option<u64> {
     None
 }
 
+fn collect_key_sizes(
+    files: &[AnnexedFile],
+    locations: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, u64> {
+    let mut key_sizes: HashMap<String, u64> = HashMap::new();
+    for f in files {
+        if let Some(sz) = f.size {
+            key_sizes.insert(f.key.clone(), sz);
+        }
+    }
+    for key in locations.keys() {
+        if !key_sizes.contains_key(key)
+            && let Some(sz) = parse_size_from_key(key)
+        {
+            key_sizes.insert(key.clone(), sz);
+        }
+    }
+    key_sizes
+}
+
+fn apply_present_stats(
+    remotes: &mut HashMap<String, Remote>,
+    locations: &HashMap<String, HashSet<String>>,
+    key_sizes: &HashMap<String, u64>,
+) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut sizes: HashMap<String, u64> = HashMap::new();
+    for (key, uuids) in locations {
+        let sz = key_sizes.get(key).copied().unwrap_or(0);
+        for u in uuids {
+            *counts.entry(u.clone()).or_default() += 1;
+            *sizes.entry(u.clone()).or_default() += sz;
+        }
+    }
+    for (u, r) in remotes.iter_mut() {
+        r.present_count = counts.get(u).copied().unwrap_or(0);
+        r.present_size = sizes.get(u).copied().unwrap_or(0);
+    }
+}
+
 fn is_secret_remote_key(k: &str) -> bool {
     matches!(
         k,
@@ -672,6 +824,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
                 trust,
                 last_fsck,
                 present_count: 0,
+                present_size: 0,
                 available_space: None,
                 groups: vec![],
                 wanted: None,
@@ -695,6 +848,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
                     trust,
                     last_fsck,
                     present_count: 0,
+                    present_size: 0,
                     available_space: None,
                     groups: vec![],
                     wanted: None,
@@ -724,6 +878,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
                     .unwrap_or(TrustLevel::SemiTrusted),
                 last_fsck: fscks.get(&uuid).copied(),
                 present_count: 0,
+                present_size: 0,
                 available_space: None,
                 groups: vec![],
                 wanted: None,
@@ -847,35 +1002,10 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let stdout = String::from_utf8_lossy(&whereis_out.stdout);
     let locations = parse_whereis_json_lines(&stdout);
 
-    // Compute present counts
-    let mut present_counts: HashMap<String, usize> = HashMap::new();
-    for us in locations.values() {
-        for u in us {
-            *present_counts.entry(u.clone()).or_default() += 1;
-        }
-    }
-    for (u, r) in remotes.iter_mut() {
-        r.present_count = present_counts.get(u).copied().unwrap_or(0);
-    }
-
     let total_keys = locations.len().max(files.len());
+    let key_sizes = collect_key_sizes(&files, &locations);
+    apply_present_stats(&mut remotes, &locations, &key_sizes);
 
-    // Build sizes for all known keys (from working tree + parse from key names for unused)
-    let mut key_sizes: HashMap<String, u64> = HashMap::new();
-    for f in &files {
-        if let Some(sz) = f.size {
-            key_sizes.insert(f.key.clone(), sz);
-        }
-    }
-    for key in locations.keys() {
-        if !key_sizes.contains_key(key)
-            && let Some(sz) = parse_size_from_key(key)
-        {
-            key_sizes.insert(key.clone(), sz);
-        }
-    }
-
-    // Compute storage report
     let mut unique_size = 0u64;
     let mut consumed_size = 0u64;
     for (key, uuids) in &locations {
@@ -1415,6 +1545,83 @@ u2 something else timestamp=9s
         assert!(merged.contains_key("/data/media/c"));
         assert!(merged.contains_key("/data/backup/b"));
         assert!(!merged.contains_key("/data/media/gone"));
+    }
+
+    #[test]
+    fn aggregate_remote_usage_sums_same_name_across_repos() {
+        fn usage(name: &str, size: u64, count: usize, kind: Option<&str>) -> RemoteUsage {
+            RemoteUsage {
+                name: name.into(),
+                uuid: format!("{name}-uuid"),
+                present_count: count,
+                present_size: size,
+                special_type: kind.map(|s| s.to_string()),
+            }
+        }
+        fn summary(usage: Vec<RemoteUsage>) -> RepoSummary {
+            RepoSummary {
+                root: PathBuf::from("/r"),
+                uuid: String::new(),
+                name: "r".into(),
+                annex_description: String::new(),
+                file_count: 0,
+                remote_count: usage.len(),
+                here_present_count: 0,
+                here_available_space: None,
+                unique_size: 0,
+                consumed_size: 0,
+                remote_usage: usage,
+            }
+        }
+        let rows = aggregate_remote_usage(&[
+            summary(vec![
+                usage("orca", 1000, 2, None),
+                usage("hetzner", 500, 1, Some("rclone")),
+            ]),
+            summary(vec![
+                usage("orca", 250, 3, None),
+                usage("hetzner", 50, 1, Some("rclone")),
+                usage("web", 10, 1, Some("web")),
+            ]),
+            summary(vec![usage("empty", 0, 0, Some("rclone"))]),
+        ]);
+        assert_eq!(rows[0], ("hetzner (rclone)".into(), 550, 2, 2));
+        assert_eq!(rows[1], ("web (web)".into(), 10, 1, 1));
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn remote_name_stats_counts_unique_names() {
+        fn usage(name: &str) -> RemoteUsage {
+            RemoteUsage {
+                name: name.into(),
+                uuid: format!("{name}-uuid"),
+                present_count: 0,
+                present_size: 0,
+                special_type: None,
+            }
+        }
+        fn summary(usage: Vec<RemoteUsage>) -> RepoSummary {
+            RepoSummary {
+                root: PathBuf::from("/r"),
+                uuid: String::new(),
+                name: "r".into(),
+                annex_description: String::new(),
+                file_count: 0,
+                remote_count: usage.len(),
+                here_present_count: 0,
+                here_available_space: None,
+                unique_size: 0,
+                consumed_size: 0,
+                remote_usage: usage,
+            }
+        }
+        let (unique, summed) = remote_name_stats(&[
+            summary(vec![usage("hdd-sata-02"), usage("orca")]),
+            summary(vec![usage("hdd-sata-02"), usage("usb")]),
+        ]);
+        assert_eq!(unique, 3);
+        assert_eq!(summed, 4);
     }
 
     #[test]

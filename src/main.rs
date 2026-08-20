@@ -156,7 +156,22 @@ fn main() -> Result<()> {
             "  total storage across all drives (with copies): {}",
             util::human_bytes(total_consumed)
         );
-        println!("  total working tree files: {}\n", total_files);
+        println!("  total working tree files: {}", total_files);
+        let summaries: Vec<_> = loaded.iter().map(|(_, m)| m.to_summary()).collect();
+        let per_remote = annex::aggregate_remote_usage(&summaries);
+        if !per_remote.is_empty() {
+            println!("  storage per special remote (rclone etc.):");
+            for (name, bytes, keys, repos) in per_remote {
+                println!(
+                    "    - {} : {} ({} keys, {} repos)",
+                    name,
+                    util::human_bytes(bytes),
+                    keys,
+                    repos
+                );
+            }
+        }
+        println!();
 
         for (r, m) in &loaded {
             let clean = r
@@ -199,12 +214,17 @@ fn main() -> Result<()> {
                     .map(|b| format!(" {} free", util::human_bytes(b)))
                     .unwrap_or_default();
                 println!(
-                    "    - {} ({}){} trust={} present={} keys{}{}",
+                    "    - {} ({}){} trust={} present={} keys{}{}{}",
                     rem.name(),
                     rem.rtype(),
                     marker,
                     rem.trust.as_str(),
                     rem.present_count,
+                    if rem.present_size > 0 {
+                        format!(" {}", util::human_bytes(rem.present_size))
+                    } else {
+                        String::new()
+                    },
                     fs,
                     sp
                 );

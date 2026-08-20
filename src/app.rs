@@ -256,6 +256,7 @@ impl App {
                         here_available_space: None,
                         unique_size: 0,
                         consumed_size: 0,
+                        remote_usage: vec![],
                     };
                     s.ensure_name();
                     s

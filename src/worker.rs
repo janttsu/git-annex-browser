@@ -86,6 +86,7 @@ pub fn spawn(
                     here_available_space: None,
                     unique_size: 0,
                     consumed_size: 0,
+                    remote_usage: vec![],
                 };
                 sum.ensure_name();
                 worker.app.summaries.push(sum);
