@@ -27,6 +27,7 @@ Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group
 - For each file: locations (trusted and untrusted copies) + key + size
 - The TUI shows the cache immediately, then re-scans every annex in the background and refreshes the view (and cache) as each repo finishes
 - Global report includes unique vs total-with-copies size, plus storage per special remote (rclone etc.; other annex clones are omitted)
+- Live visual report: per-repo size bars and copy-health colour (red=under numcopies, yellow=mixed, green=ok), updating as the background scan fills in data. Select a repo for a per-drive visual; `z` (or Enter on the report) zooms to full screen.
 - Keyboard-driven tree navigation like zfs-browser
 - `/` filters the current list
 

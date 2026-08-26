@@ -98,6 +98,11 @@ pub fn spawn(
                     unique_size: 0,
                     consumed_size: 0,
                     remote_usage: vec![],
+                    numcopies: None,
+                    keys_tracked: 0,
+                    keys_under: 0,
+                    keys_ok: 0,
+                    keys_over: 0,
                 };
                 sum.ensure_name();
                 worker.app.summaries.push(sum);

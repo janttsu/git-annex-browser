@@ -4,7 +4,7 @@ App state and command dispatch, modeled on zfs-browser.
 The heavy data lives on the worker thread.
 */
 
-use crate::annex::{self, AnnexMetadata, RepoSummary};
+use crate::annex::{self, AnnexMetadata, RepoSummary, aggregate_remote_usage};
 use crate::node::{Node, RepoLoadingNode, RepoNode, RootNode};
 use anyhow::Result;
 use std::collections::HashMap;
@@ -84,11 +84,20 @@ impl App {
 
         let list_items: Vec<ListItem> = kids
             .iter()
-            .map(|n| ListItem {
-                label: n.label(),
-                kind: n.kind().to_string(),
-                anomalous: n.anomalous(),
-                trust: n.trust(),
+            .map(|n| {
+                let repo_name = n.annex_repo_path().or(n.loaded_repo_path()).and_then(|p| {
+                    self.summaries
+                        .iter()
+                        .find(|s| s.root == p)
+                        .map(|s| s.name.clone())
+                });
+                ListItem {
+                    label: n.label(),
+                    kind: n.kind().to_string(),
+                    anomalous: n.anomalous(),
+                    trust: n.trust(),
+                    repo_name,
+                }
             })
             .collect();
 
@@ -102,12 +111,21 @@ impl App {
 
         let crumb: Vec<String> = self.stack.iter().map(|l| l.node.label()).collect();
 
+        let visual = Some(VisualReport::from_summaries(&self.summaries));
+        let repo_visuals: Vec<VisualRepoDetail> = self
+            .summaries
+            .iter()
+            .map(VisualRepoDetail::from_summary)
+            .collect();
+
         ViewSnapshot {
             crumb,
             list: list_items,
             selected: sel,
             details,
             raw,
+            visual,
+            repo_visuals,
             status: self.status.clone(),
             total_repos: if let Some(r) = self.stack.first() {
                 r.node
@@ -169,7 +187,10 @@ impl App {
             Command::Descend => {
                 let l = self.stack.last().unwrap();
                 let kids = l.node.children();
-                if let Some(child) = kids.get(l.selected) {
+                if let Some(child) = kids.get(l.selected)
+                    && child.kind() != "report"
+                    && child.kind() != "viz"
+                {
                     if let Some(p) = child.annex_repo_path() {
                         if let Some(meta) = self.preloaded.get(p).cloned() {
                             // Instant because of bg pre-scan or cache
@@ -261,6 +282,11 @@ impl App {
                         unique_size: 0,
                         consumed_size: 0,
                         remote_usage: vec![],
+                        numcopies: None,
+                        keys_tracked: 0,
+                        keys_under: 0,
+                        keys_ok: 0,
+                        keys_over: 0,
                     };
                     s.ensure_name();
                     s
@@ -382,6 +408,8 @@ pub struct ViewSnapshot {
     pub selected: usize,
     pub details: Vec<String>,
     pub raw: Option<String>,
+    pub visual: Option<VisualReport>,
+    pub repo_visuals: Vec<VisualRepoDetail>,
     pub status: String,
     pub total_repos: usize,
     pub scanning: bool,
@@ -394,6 +422,145 @@ pub struct ListItem {
     /// True if this drive/repo setup differs from the common setup for drives/repos with the same name/folder.
     pub anomalous: bool,
     pub trust: Option<crate::annex::TrustLevel>,
+    /// Short annex name, when this row is a repo or per-repo visual.
+    pub repo_name: Option<String>,
+}
+
+/// Live dashboard for the global report (bars + copy-health).
+#[derive(Debug, Clone)]
+pub struct VisualReport {
+    pub unique_size: u64,
+    pub consumed_size: u64,
+    pub repos: Vec<VisualRepo>,
+    pub remotes: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisualRepo {
+    pub name: String,
+    pub unique_size: u64,
+    pub numcopies: u32,
+    pub keys_tracked: usize,
+    pub keys_under: usize,
+    pub keys_ok: usize,
+    pub keys_over: usize,
+}
+
+pub fn copy_health_kind(tracked: usize, under: usize) -> &'static str {
+    if tracked == 0 {
+        "unknown"
+    } else if under == 0 {
+        "ok"
+    } else if under * 2 >= tracked {
+        "poor"
+    } else {
+        "mixed"
+    }
+}
+
+impl VisualRepo {
+    pub fn health_kind(&self) -> &'static str {
+        copy_health_kind(self.keys_tracked, self.keys_under)
+    }
+}
+
+impl VisualReport {
+    pub fn from_summaries(summaries: &[RepoSummary]) -> Self {
+        let mut repos: Vec<VisualRepo> = summaries
+            .iter()
+            .map(|s| VisualRepo {
+                name: s.name.clone(),
+                unique_size: s.unique_size,
+                numcopies: s.numcopies.unwrap_or(1).max(1),
+                keys_tracked: s.keys_tracked,
+                keys_under: s.keys_under,
+                keys_ok: s.keys_ok,
+                keys_over: s.keys_over,
+            })
+            .collect();
+        repos.sort_by(|a, b| {
+            b.unique_size
+                .cmp(&a.unique_size)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        let remotes = aggregate_remote_usage(summaries)
+            .into_iter()
+            .map(|(n, b, _, _)| (n, b))
+            .collect();
+        Self {
+            unique_size: summaries.iter().map(|s| s.unique_size).sum(),
+            consumed_size: summaries.iter().map(|s| s.consumed_size).sum(),
+            repos,
+            remotes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualRemoteKind {
+    Here,
+    Special,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisualRemote {
+    pub name: String,
+    pub size: u64,
+    pub count: usize,
+    pub kind: VisualRemoteKind,
+}
+
+/// Per-repo dashboard (size by drive + copy health).
+#[derive(Debug, Clone)]
+pub struct VisualRepoDetail {
+    pub name: String,
+    pub unique_size: u64,
+    pub consumed_size: u64,
+    pub numcopies: u32,
+    pub keys_tracked: usize,
+    pub keys_under: usize,
+    pub keys_ok: usize,
+    pub keys_over: usize,
+    pub remotes: Vec<VisualRemote>,
+}
+
+impl VisualRepoDetail {
+    pub fn health_kind(&self) -> &'static str {
+        copy_health_kind(self.keys_tracked, self.keys_under)
+    }
+
+    pub fn from_summary(s: &RepoSummary) -> Self {
+        let mut remotes: Vec<VisualRemote> = s
+            .remote_usage
+            .iter()
+            .filter(|u| u.present_count > 0 || u.present_size > 0)
+            .map(|u| VisualRemote {
+                name: u.name.clone(),
+                size: u.present_size,
+                count: u.present_count,
+                kind: if u.uuid == s.uuid {
+                    VisualRemoteKind::Here
+                } else if u.is_transfer_remote() {
+                    VisualRemoteKind::Special
+                } else {
+                    VisualRemoteKind::Other
+                },
+            })
+            .collect();
+        remotes.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+        Self {
+            name: s.name.clone(),
+            unique_size: s.unique_size,
+            consumed_size: s.consumed_size,
+            numcopies: s.numcopies.unwrap_or(1).max(1),
+            keys_tracked: s.keys_tracked,
+            keys_under: s.keys_under,
+            keys_ok: s.keys_ok,
+            keys_over: s.keys_over,
+            remotes,
+        }
+    }
 }
 
 // Small helper for downcasting Rc<dyn Node> (simple since Rust 1.0 no built-in, use a tiny trick or Any).
