@@ -176,6 +176,21 @@ pub struct RepoSummary {
     /// Per-remote occupancy, for the global report (name is the grouping key).
     #[serde(default)]
     pub remote_usage: Vec<RemoteUsage>,
+    /// Desired copies (`annex.numcopies`), default 1 when unset.
+    #[serde(default)]
+    pub numcopies: Option<u32>,
+    /// Keys with location records (for copy-health).
+    #[serde(default)]
+    pub keys_tracked: usize,
+    /// Keys with fewer copies than numcopies.
+    #[serde(default)]
+    pub keys_under: usize,
+    /// Keys with exactly numcopies copies.
+    #[serde(default)]
+    pub keys_ok: usize,
+    /// Keys with more copies than numcopies.
+    #[serde(default)]
+    pub keys_over: usize,
 }
 
 /// One remote's stored keys/bytes inside a single annex.
@@ -214,6 +229,8 @@ impl AnnexMetadata {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.description.clone());
+        let want = self.numcopies.unwrap_or(1).max(1);
+        let (keys_under, keys_ok, keys_over) = copy_health_counts(&self.locations, want);
         RepoSummary {
             root: self.root.clone(),
             uuid: self.uuid.clone(),
@@ -236,6 +253,11 @@ impl AnnexMetadata {
                     special_type: r.transfer_kind(),
                 })
                 .collect(),
+            numcopies: self.numcopies,
+            keys_tracked: self.locations.len(),
+            keys_under,
+            keys_ok,
+            keys_over,
         }
     }
 
@@ -297,6 +319,28 @@ pub fn aggregate_remote_usage(summaries: &[RepoSummary]) -> Vec<(String, u64, us
         .collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     rows
+}
+
+/// Count keys below / at / above the desired number of copies.
+pub fn copy_health_counts(
+    locations: &HashMap<String, HashSet<String>>,
+    numcopies: u32,
+) -> (usize, usize, usize) {
+    let want = numcopies.max(1);
+    let mut under = 0;
+    let mut ok = 0;
+    let mut over = 0;
+    for uuids in locations.values() {
+        let n = uuids.len() as u32;
+        if n < want {
+            under += 1;
+        } else if n == want {
+            ok += 1;
+        } else {
+            over += 1;
+        }
+    }
+    (under, ok, over)
 }
 
 /// Unique remote names vs summed per-repo remote entries.
@@ -1571,6 +1615,11 @@ u2 something else timestamp=9s
                 unique_size: 0,
                 consumed_size: 0,
                 remote_usage: usage,
+                numcopies: None,
+                keys_tracked: 0,
+                keys_under: 0,
+                keys_ok: 0,
+                keys_over: 0,
             }
         }
         let rows = aggregate_remote_usage(&[
@@ -1614,6 +1663,11 @@ u2 something else timestamp=9s
                 unique_size: 0,
                 consumed_size: 0,
                 remote_usage: usage,
+                numcopies: None,
+                keys_tracked: 0,
+                keys_under: 0,
+                keys_ok: 0,
+                keys_over: 0,
             }
         }
         let (unique, summed) = remote_name_stats(&[
@@ -1622,6 +1676,19 @@ u2 something else timestamp=9s
         ]);
         assert_eq!(unique, 3);
         assert_eq!(summed, 4);
+    }
+
+    #[test]
+    fn copy_health_counts_vs_numcopies() {
+        let mut loc = HashMap::new();
+        loc.insert("a".into(), HashSet::from(["u1".into()]));
+        loc.insert("b".into(), HashSet::from(["u1".into(), "u2".into()]));
+        loc.insert(
+            "c".into(),
+            HashSet::from(["u1".into(), "u2".into(), "u3".into()]),
+        );
+        assert_eq!(copy_health_counts(&loc, 2), (1, 1, 1));
+        assert_eq!(copy_health_counts(&loc, 1), (0, 1, 2));
     }
 
     #[test]

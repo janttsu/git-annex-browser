@@ -83,7 +83,7 @@ impl Node for RootNode {
         vec![
             format!("root: {}", self.scan_root.display()),
             format!("annex repos found: {}", self.summaries.len()),
-            "The first item in the list is 'Global report (all repos)' — select it for totals across everything.".into(),
+            "The first item is 'Global report' — size bars and copy-health vs numcopies, live as scan proceeds.".into(),
             "Use --scan to refresh cache.".into(),
         ]
     }
@@ -280,6 +280,9 @@ impl Node for RepoNode {
     fn children(&self) -> Vec<Rc<dyn Node>> {
         // Lead with drives so you immediately see presence on all disks
         let mut kids: Vec<Rc<dyn Node>> = vec![
+            Rc::new(RepoVisualNode {
+                root: self.meta.root.clone(),
+            }),
             Rc::new(DrivesNode {
                 meta: Rc::clone(&self.meta),
                 drive_profiles: Rc::clone(&self.drive_profiles),
@@ -409,6 +412,29 @@ impl Node for RepoInfoNode {
 }
 
 /// List of all drives/remotes for the repo.
+/// Per-repo visual dashboard (opened from inside a repo).
+pub struct RepoVisualNode {
+    pub root: PathBuf,
+}
+
+impl Node for RepoVisualNode {
+    fn label(&self) -> String {
+        "visual overview".into()
+    }
+    fn kind(&self) -> &'static str {
+        "viz"
+    }
+    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+        Some(&self.root)
+    }
+    fn details(&self) -> Vec<String> {
+        vec![
+            "Live size bars and copy-health for this repository.".into(),
+            "Press z for a full-screen view.".into(),
+        ]
+    }
+}
+
 pub struct DrivesNode {
     pub meta: Rc<AnnexMetadata>,
     pub drive_profiles: Rc<HashMap<String, DriveProfile>>,

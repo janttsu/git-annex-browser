@@ -254,6 +254,7 @@ fn main() -> Result<()> {
     let mut detail_scroll: usize = 0;
     let mut filter = String::new();
     let mut filter_editing = false;
+    let mut zoom = false;
 
     loop {
         while let Ok(msg) = snap_rx.try_recv() {
@@ -285,6 +286,7 @@ fn main() -> Result<()> {
                 detail_scroll,
                 &filter,
                 filter_editing,
+                zoom,
             )
         })?;
 
@@ -335,11 +337,16 @@ fn main() -> Result<()> {
             continue;
         }
 
+        if key.code == KeyCode::Char('z') && !show_help {
+            zoom = !zoom;
+            continue;
+        }
+
         if key.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
         {
             let page = tui::page_size(&guard.term).max(1);
-            let rows = snapshot.as_ref().map(|s| s.details.len()).unwrap_or(0);
+            let rows = snapshot.as_ref().map(tui::detail_scroll_rows).unwrap_or(0);
             let max = rows.saturating_sub(page);
             detail_scroll = match key.code {
                 KeyCode::PageDown => (detail_scroll + page).min(max),
@@ -350,6 +357,9 @@ fn main() -> Result<()> {
 
         let cmd = map_key(key);
         match cmd {
+            Command::Quit if zoom => {
+                zoom = false;
+            }
             Command::Quit => {
                 request_quit(&cancel, &cmd_tx);
                 break;
@@ -379,10 +389,24 @@ fn main() -> Result<()> {
                 }
                 pending += 1;
             }
+            Command::Back if zoom => {
+                zoom = false;
+            }
             Command::Descend | Command::Back | Command::Refresh => {
+                let kind = snapshot
+                    .as_ref()
+                    .and_then(|s| s.list.get(s.selected))
+                    .map(|i| i.kind.as_str());
+                if cmd == Command::Descend && matches!(kind, Some("report") | Some("viz")) {
+                    zoom = true;
+                    continue;
+                }
                 if matches!(cmd, Command::Descend | Command::Back | Command::Refresh) {
                     filter.clear();
                     filter_editing = false;
+                }
+                if cmd == Command::Refresh {
+                    zoom = false;
                 }
                 let page = tui::page_size(&guard.term);
                 if cmd_tx.send(WorkerMsg::Nav(cmd, page)).is_err() {
@@ -418,11 +442,19 @@ fn apply_background_snapshot(
             cur.status = incoming.status;
             cur.total_repos = incoming.total_repos;
             cur.scanning = incoming.scanning;
+            cur.visual = incoming.visual;
+            cur.repo_visuals = incoming.repo_visuals;
+            cur.details = if selected_matches {
+                incoming.details
+            } else {
+                cur.details.clone()
+            };
+            cur.raw = if selected_matches {
+                incoming.raw
+            } else {
+                cur.raw.clone()
+            };
             cur.selected = sel;
-            if selected_matches {
-                cur.details = incoming.details;
-                cur.raw = incoming.raw;
-            }
         }
         return;
     }
