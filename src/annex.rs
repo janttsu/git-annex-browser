@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -230,7 +230,8 @@ impl AnnexMetadata {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.description.clone());
         let want = self.numcopies.unwrap_or(1).max(1);
-        let (keys_under, keys_ok, keys_over) = copy_health_counts(&self.locations, want);
+        let (keys_under, keys_ok, keys_over) =
+            copy_health_counts(&self.locations, want, &self.remotes);
         RepoSummary {
             root: self.root.clone(),
             uuid: self.uuid.clone(),
@@ -277,6 +278,9 @@ impl AnnexMetadata {
             let mut u = 0u64;
             let mut c = 0u64;
             for (key, uuids) in &self.locations {
+                if uuids.is_empty() {
+                    continue;
+                }
                 if let Some(&sz) = key_sizes.get(key) {
                     u += sz;
                     c += sz * (uuids.len() as u64);
@@ -322,16 +326,22 @@ pub fn aggregate_remote_usage(summaries: &[RepoSummary]) -> Vec<(String, u64, us
 }
 
 /// Count keys below / at / above the desired number of copies.
+/// Untrusted and dead remotes are omitted — git-annex `numcopies` does the same
+/// (Glacier etc. store bytes but do not satisfy the copy requirement).
 pub fn copy_health_counts(
     locations: &HashMap<String, HashSet<String>>,
     numcopies: u32,
+    remotes: &HashMap<String, Remote>,
 ) -> (usize, usize, usize) {
     let want = numcopies.max(1);
     let mut under = 0;
     let mut ok = 0;
     let mut over = 0;
     for uuids in locations.values() {
-        let n = uuids.len() as u32;
+        let n = uuids
+            .iter()
+            .filter(|u| counts_toward_numcopies(remotes, u))
+            .count() as u32;
         if n < want {
             under += 1;
         } else if n == want {
@@ -341,6 +351,13 @@ pub fn copy_health_counts(
         }
     }
     (under, ok, over)
+}
+
+fn counts_toward_numcopies(remotes: &HashMap<String, Remote>, uuid: &str) -> bool {
+    !matches!(
+        remotes.get(uuid).map(|r| r.trust),
+        Some(TrustLevel::UnTrusted) | Some(TrustLevel::Dead)
+    )
 }
 
 /// Unique remote names vs summed per-repo remote entries.
@@ -658,6 +675,214 @@ fn parse_content_log(text: &str) -> HashMap<String, String> {
         }
     }
     latest.into_iter().map(|(u, (_, e))| (u, e)).collect()
+}
+
+/// Path of a per-key location log on the git-annex branch (`xx/yy/KEY.log`).
+fn is_location_log_path(path: &str) -> bool {
+    let mut parts = path.split('/');
+    let Some(a) = parts.next() else {
+        return false;
+    };
+    let Some(b) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let hashdir = (a.len() == 2 || a.len() == 3) && (b.len() == 2 || b.len() == 3);
+    hashdir && name.ends_with(".log") && !name.contains(".log.")
+}
+
+fn location_log_key(path: &str) -> Option<&str> {
+    path.rsplit('/').next()?.strip_suffix(".log")
+}
+
+/// Parse one location-log file. Last-write-wins per UUID.
+///
+/// git-annex 10+ (timestamp first): `1317929189.157s 1 UUID`
+/// Older: `UUID 1 timestamp=1317929189s`
+pub fn parse_location_log(text: &str) -> HashSet<String> {
+    let mut latest: HashMap<String, (i64, bool)> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((uuid, ts, present)) = parse_location_log_line(line) else {
+            continue;
+        };
+        match latest.get(&uuid) {
+            Some((old, _)) if ts < *old => {}
+            _ => {
+                latest.insert(uuid, (ts, present));
+            }
+        }
+    }
+    latest
+        .into_iter()
+        .filter_map(|(u, (_, present))| present.then_some(u))
+        .collect()
+}
+
+fn parse_location_log_line(line: &str) -> Option<(String, i64, bool)> {
+    if line.contains("timestamp=") {
+        let (body, ts) = split_log_timestamp(line);
+        let mut parts = body.split_whitespace();
+        let uuid = parts.next().filter(|u| !u.is_empty())?.to_string();
+        let status = parts.next().unwrap_or("1");
+        Some((uuid, ts.unwrap_or(0), status == "1"))
+    } else {
+        let mut parts = line.split_whitespace();
+        let ts_raw = parts.next()?;
+        let status = parts.next()?;
+        let uuid = parts.next().filter(|u| !u.is_empty())?.to_string();
+        Some((
+            uuid,
+            parse_annex_timestamp(ts_raw).unwrap_or(0),
+            status == "1",
+        ))
+    }
+}
+
+/// Presence map from git-annex branch location logs (includes untrusted remotes).
+fn load_locations_from_branch(root: &Path) -> HashMap<String, HashSet<String>> {
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-r", "-z", "git-annex"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+
+    let mut shas = Vec::new();
+    let mut keys = Vec::new();
+    for entry in out.stdout.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Ok(s) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        let Some((meta, path)) = s.split_once('\t') else {
+            continue;
+        };
+        if !is_location_log_path(path) {
+            continue;
+        }
+        let Some(key) = location_log_key(path) else {
+            continue;
+        };
+        let Some(sha) = meta.split_whitespace().nth(2) else {
+            continue;
+        };
+        shas.push(sha.to_string());
+        keys.push(key.to_string());
+    }
+    if shas.is_empty() {
+        return HashMap::new();
+    }
+
+    cat_file_location_logs(root, shas, keys)
+}
+
+/// `git cat-file --batch` the location-log blobs. A writer thread avoids
+/// deadlock when the pipe buffer fills before we start reading.
+fn cat_file_location_logs(
+    root: &Path,
+    shas: Vec<String>,
+    keys: Vec<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut child = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return HashMap::new();
+    };
+    let Some(stdout) = child.stdout.take() else {
+        return HashMap::new();
+    };
+
+    let writer = std::thread::spawn(move || {
+        for sha in shas {
+            if stdin.write_all(sha.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut locations = HashMap::with_capacity(keys.len());
+    let mut header = String::new();
+    let mut nl = [0u8; 1];
+    for key in keys {
+        header.clear();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            break;
+        }
+        let header_trim = header.trim_end();
+        if header_trim.ends_with("missing") {
+            continue;
+        }
+        let size: usize = header_trim
+            .split_whitespace()
+            .nth(2)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let mut buf = vec![0u8; size];
+        if size > 0 && reader.read_exact(&mut buf).is_err() {
+            break;
+        }
+        if reader.read_exact(&mut nl).is_err() {
+            break;
+        }
+        let uuids = parse_location_log(&String::from_utf8_lossy(&buf));
+        if !uuids.is_empty() {
+            locations.insert(key, uuids);
+        }
+    }
+    drop(reader);
+    let _ = child.wait();
+    let _ = writer.join();
+    locations
+}
+
+/// mtime of the git-annex branch ref (or packed-refs). Used to hydrate recently
+/// updated repos first so Glacier copies show up without waiting for the whole scan.
+pub fn annex_branch_mtime(root: &Path) -> Option<i64> {
+    let git_dir = resolve_git_dir(root)?;
+    let candidates = [
+        git_dir.join("refs/heads/git-annex"),
+        git_dir.join("packed-refs"),
+    ];
+    let mut best: Option<i64> = None;
+    for p in candidates {
+        if let Ok(meta) = std::fs::metadata(p)
+            && let Ok(modified) = meta.modified()
+            && let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            let secs = d.as_secs() as i64;
+            best = Some(best.map_or(secs, |b| b.max(secs)));
+        }
+    }
+    best
 }
 
 /// numcopies.log / mincopies.log: `timestamp number` (timestamp-first).
@@ -1031,20 +1256,10 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         let _ = child.wait();
     }
 
-    // Build locations using whereis --json --all  (NDJSON). Include the
-    // `untrusted` array so copies on untrusted drives are not dropped.
-    let whereis_out = Command::new("git")
-        .arg("-C")
-        .arg(&root)
-        .arg("annex")
-        .arg("whereis")
-        .arg("--json")
-        .arg("--all")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()?;
-    let stdout = String::from_utf8_lossy(&whereis_out.stdout);
-    let locations = parse_whereis_json_lines(&stdout);
+    // Presence from git-annex branch location logs (includes untrusted remotes
+    // such as Glacier). `whereis --json --all` is too slow on large annexes and
+    // left used-storage figures stale after `copy --to` Glacier.
+    let locations = load_locations_from_branch(&root);
 
     let total_keys = locations.len().max(files.len());
     let key_sizes = collect_key_sizes(&files, &locations);
@@ -1053,6 +1268,9 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let mut unique_size = 0u64;
     let mut consumed_size = 0u64;
     for (key, uuids) in &locations {
+        if uuids.is_empty() {
+            continue;
+        }
         if let Some(&sz) = key_sizes.get(key) {
             unique_size += sz;
             consumed_size += sz * (uuids.len() as u64);
@@ -1687,8 +1905,99 @@ u2 something else timestamp=9s
             "c".into(),
             HashSet::from(["u1".into(), "u2".into(), "u3".into()]),
         );
-        assert_eq!(copy_health_counts(&loc, 2), (1, 1, 1));
-        assert_eq!(copy_health_counts(&loc, 1), (0, 1, 2));
+        let none = HashMap::new();
+        assert_eq!(copy_health_counts(&loc, 2, &none), (1, 1, 1));
+        assert_eq!(copy_health_counts(&loc, 1, &none), (0, 1, 2));
+    }
+
+    #[test]
+    fn copy_health_ignores_untrusted_and_dead() {
+        let mut loc = HashMap::new();
+        loc.insert("only-glacier".into(), HashSet::from(["glacier".into()]));
+        loc.insert(
+            "here-and-glacier".into(),
+            HashSet::from(["here".into(), "glacier".into()]),
+        );
+        loc.insert(
+            "here-disk-glacier".into(),
+            HashSet::from([
+                "here".into(),
+                "disk".into(),
+                "glacier".into(),
+                "dead".into(),
+            ]),
+        );
+        let mut remotes = HashMap::new();
+        for (uuid, trust) in [
+            ("here", TrustLevel::Trusted),
+            ("disk", TrustLevel::SemiTrusted),
+            ("glacier", TrustLevel::UnTrusted),
+            ("dead", TrustLevel::Dead),
+        ] {
+            remotes.insert(
+                uuid.to_string(),
+                Remote {
+                    uuid: uuid.into(),
+                    description: uuid.into(),
+                    config: HashMap::new(),
+                    trust,
+                    last_fsck: None,
+                    present_count: 0,
+                    present_size: 0,
+                    available_space: None,
+                    groups: vec![],
+                    wanted: None,
+                    required: None,
+                },
+            );
+        }
+        // numcopies=1: only-glacier is under (untrusted doesn't count), others ok/over
+        assert_eq!(copy_health_counts(&loc, 1, &remotes), (1, 1, 1));
+        assert_eq!(copy_health_counts(&loc, 2, &remotes), (2, 1, 0));
+    }
+
+    #[test]
+    fn location_log_new_format_last_write_wins_includes_untrusted() {
+        let text = "\
+100.0s 1 here-uuid
+200.5s 1 glacier-uuid
+150.0s 1 here-uuid
+250s 0 here-uuid
+300.1s 1 glacier-uuid
+";
+        let set = parse_location_log(text);
+        assert!(!set.contains("here-uuid"), "dropped locally: {set:?}");
+        assert!(
+            set.contains("glacier-uuid"),
+            "glacier still present: {set:?}"
+        );
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn location_log_old_format_and_fractional_ts() {
+        let text = "\
+here-uuid 1 timestamp=100.1s
+glacier-uuid 1 timestamp=200.9s
+here-uuid 0 timestamp=150.0s
+here-uuid 1 timestamp=125s
+";
+        let set = parse_location_log(text);
+        assert!(!set.contains("here-uuid"));
+        assert!(set.contains("glacier-uuid"));
+    }
+
+    #[test]
+    fn location_log_path_is_hashed_key_log() {
+        assert!(is_location_log_path("1ba/48f/SHA256E-s4171072--aa.mp4.log"));
+        assert!(is_location_log_path("ab/cd/WORM-s1-m2--x.log"));
+        assert!(!is_location_log_path("uuid.log"));
+        assert!(!is_location_log_path("1ba/48f/SHA256E-s1--aa.log.cnk"));
+        assert!(!is_location_log_path("1ba/48f/SHA256E-s1--aa.log.met"));
+        assert_eq!(
+            location_log_key("1ba/48f/SHA256E-s1--aa.mp4.log"),
+            Some("SHA256E-s1--aa.mp4")
+        );
     }
 
     #[test]

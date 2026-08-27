@@ -15,7 +15,7 @@ All this information is available via normal `git annex` commands, but querying 
 
 **Binary name:** `git-annex-browser`
 
-Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, and so on) plus `git annex whereis --json --all` / `git annex find`. The TUI itself is view-only.
+Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, per-key location logs, and so on) plus `git annex find`. Location logs include untrusted remotes (e.g. Glacier), so used-storage figures update after `git annex copy --to` without a slow `whereis --all`. The TUI itself is view-only.
 
 ## Features
 - Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees).
@@ -108,7 +108,7 @@ git-annex-browser --scan --quiet /path/with/annexes
 - View only: no `git annex get` / `drop` / `trust`.
 - Nested annexes inside another annex working tree are not discovered (the parent annex is a prune point).
 - Very large annexes (>50k files) still materialize the file tree when you open "all files" or a drive's file list; prefer drive-specific views and `/` filter.
-- Drive file lists use cached `whereis` data, not a live `git annex list`.
+- Drive file lists use cached location-log data, not a live `git annex list`.
 
 ## Future Ideas
 - Opt-in write support (`git annex trust`, copy hints).
