@@ -267,7 +267,8 @@ fn persist_scan(app: &App, scan_root: &std::path::Path) {
     let _ = annex::merge_scan_into_cache(scan_root, repos);
 }
 
-/// Uncached repos first (pop from the end), then refresh already-cached ones.
+/// Uncached repos first (pop from the end), then already-cached ones with the
+/// newest git-annex branch first so a just-updated Glacier remote hydrates soon.
 fn queue_hydrate(app: &mut App, discovered: &[PathBuf]) {
     let mut cached = Vec::new();
     let mut fresh = Vec::new();
@@ -278,6 +279,7 @@ fn queue_hydrate(app: &mut App, discovered: &[PathBuf]) {
             fresh.push(p.clone());
         }
     }
+    cached.sort_by_key(|p| annex::annex_branch_mtime(p).unwrap_or(0));
     app.to_hydrate.clear();
     app.to_hydrate.extend(cached);
     app.to_hydrate.extend(fresh);
