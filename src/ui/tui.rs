@@ -3,6 +3,7 @@ TUI rendering using ratatui. Styled after zfs-browser.
 */
 
 use crate::app::{ViewSnapshot, VisualRemoteKind, VisualRepo, VisualRepoDetail, VisualReport};
+use crate::usage::UsageListing;
 use crate::util::human_bytes;
 use crossterm::{
     cursor::{Hide, Show},
@@ -43,6 +44,8 @@ static HELP_TEXT: &str = r#"
 Focus on drives (special remotes), trust, last fsck, groups/wanted, numcopies, file locations per drive.
   Global report and per-repo visual: size bars + copy-health vs numcopies.
   Enter on the report (or z) zooms it full screen; h/z back.
+  Disk usage (inside a repo): ncdu-style listing, largest dirs/files first.
+  Sizes come from git-annex keys, so dropped or missing content still counts.
 "#;
 
 pub const LIST_CHROME_ROWS: u16 = 2;
@@ -131,9 +134,13 @@ pub fn draw(
     if zoomed {
         render_details(frame, main_area, snap, detail_scroll, show_raw, true);
     } else {
-        let [list_area, detail_area] =
-            Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
-                .areas(main_area);
+        let ncdu = snap.list.iter().any(|it| it.size.is_some());
+        let [list_area, detail_area] = Layout::horizontal(if ncdu {
+            [Constraint::Percentage(50), Constraint::Percentage(50)]
+        } else {
+            [Constraint::Percentage(38), Constraint::Percentage(62)]
+        })
+        .areas(main_area);
         render_list(frame, list_area, snap, filter);
         render_details(frame, detail_area, snap, detail_scroll, show_raw, false);
     }
@@ -174,6 +181,9 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
         })
         .collect();
     let selected_vis = visible.iter().position(|(i, _)| *i == snap.selected);
+    let ncdu = visible.iter().any(|(_, it)| it.size.is_some());
+    let size_total: u64 = visible.iter().filter_map(|(_, it)| it.size).sum();
+    let bar_w = 10usize;
 
     let items: Vec<RatListItem> = visible
         .iter()
@@ -185,32 +195,69 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
                     .add_modifier(Modifier::BOLD),
                 "repo" => Style::default().fg(Color::Magenta),
                 "file" => Style::default().fg(Color::Gray),
-                "report" | "viz" => Style::default()
+                "usage" | "report" | "viz" => Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
+                "parent" => Style::default().fg(Color::DarkGray),
                 _ => Style::default(),
             };
             let sel_marker = if *i == snap.selected { "▶ " } else { "  " };
             let label_style = if it.anomalous {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if it.missing {
+                Style::default().fg(Color::DarkGray)
             } else if let Some(t) = it.trust {
                 Style::default().fg(crate::util::trust_color(t))
             } else {
                 Style::default()
             };
-            RatListItem::new(Line::from(vec![
-                Span::raw(sel_marker),
-                Span::styled(format!("[{}] ", it.kind), kind_style),
-                Span::styled(&it.label, label_style),
-            ]))
+            if ncdu {
+                let mut spans = vec![Span::raw(sel_marker)];
+                if let Some(sz) = it.size {
+                    let filled = if size_total == 0 {
+                        0
+                    } else {
+                        ((sz as f64 / size_total as f64) * bar_w as f64).round() as usize
+                    };
+                    let bar_color = if it.kind == "dir" {
+                        Color::Cyan
+                    } else {
+                        Color::Gray
+                    };
+                    spans.push(Span::styled(
+                        format!("{:>9} ", human_bytes(sz)),
+                        Style::default().fg(Color::White),
+                    ));
+                    spans.extend(block_bar(filled, bar_w, bar_color));
+                    spans.push(Span::raw(" "));
+                } else {
+                    spans.push(Span::styled(
+                        format!("{:>9} ", ""),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    spans.push(Span::styled(
+                        " ".repeat(bar_w + 1),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                spans.push(Span::styled(&it.label, label_style));
+                RatListItem::new(Line::from(spans))
+            } else {
+                RatListItem::new(Line::from(vec![
+                    Span::raw(sel_marker),
+                    Span::styled(format!("[{}] ", it.kind), kind_style),
+                    Span::styled(&it.label, label_style),
+                ]))
+            }
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" git-annex-browser ({}) ", snap.total_repos)),
-    );
+    let title = if ncdu {
+        " disk usage (largest first) ".to_string()
+    } else {
+        format!(" git-annex-browser ({}) ", snap.total_repos)
+    };
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
     let mut state = ListState::default();
     state.select(selected_vis);
     frame.render_stateful_widget(list, area, &mut state);
@@ -232,6 +279,7 @@ fn visual_for(snap: &ViewSnapshot) -> VisualKind {
     match selected_kind(snap) {
         "report" if snap.visual.is_some() => VisualKind::Global,
         "repo" | "viz" if selected_repo_visual(snap).is_some() => VisualKind::Repo,
+        "usage" | "dir" if snap.usage.is_some() => VisualKind::Usage,
         _ => VisualKind::None,
     }
 }
@@ -241,6 +289,7 @@ enum VisualKind {
     None,
     Global,
     Repo,
+    Usage,
 }
 
 fn render_details(
@@ -262,6 +311,12 @@ fn render_details(
             VisualKind::Repo => {
                 if let Some(vis) = selected_repo_visual(snap) {
                     render_repo_visual(frame, area, vis, snap.scanning, scroll, zoomed);
+                    return;
+                }
+            }
+            VisualKind::Usage => {
+                if let Some(listing) = &snap.usage {
+                    render_usage_listing(frame, area, listing, scroll, zoomed);
                     return;
                 }
             }
@@ -411,6 +466,11 @@ pub fn detail_scroll_rows(snap: &ViewSnapshot) -> usize {
             .unwrap_or(snap.details.len()),
         VisualKind::Repo => selected_repo_visual(snap)
             .map(|v| 7 + v.remotes.len())
+            .unwrap_or(snap.details.len()),
+        VisualKind::Usage => snap
+            .usage
+            .as_ref()
+            .map(|v| 5 + v.entries.len())
             .unwrap_or(snap.details.len()),
         VisualKind::None => snap.details.len(),
     }
@@ -606,6 +666,104 @@ fn render_repo_visual(
                 bar_w,
                 color,
             ));
+        }
+    }
+
+    let p = Paragraph::new(lines).scroll((scroll as u16, 0));
+    frame.render_widget(p, inner);
+}
+
+fn render_usage_listing(
+    frame: &mut Frame,
+    area: Rect,
+    listing: &UsageListing,
+    scroll: usize,
+    zoomed: bool,
+) {
+    let title = if zoomed {
+        " disk usage (git-annex sizes)  z/h=back "
+    } else {
+        " disk usage (git-annex sizes)  z=full screen "
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < 24 || inner.height == 0 {
+        return;
+    }
+
+    let w = inner.width as usize;
+    let name_w = (w / 3).clamp(14, 32);
+    let (bar_w, _) = bar_budget(w, name_w);
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled(
+            listing.path.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            human_bytes(listing.total_size),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("   {} files", listing.file_count)),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "sizes from git-annex keys — content need not be present here",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "largest first",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    if listing.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no annexed files",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for e in &listing.entries {
+            let color = if e.is_dir { Color::Cyan } else { Color::Gray };
+            let filled = if listing.total_size == 0 {
+                0
+            } else {
+                ((e.size as f64 / listing.total_size as f64) * bar_w as f64).round() as usize
+            };
+            let mut spans = vec![Span::styled(
+                trunc_name(&e.name, name_w),
+                Style::default().fg(color),
+            )];
+            spans.push(Span::raw(" "));
+            spans.extend(block_bar(filled, bar_w, color));
+            spans.push(Span::styled(
+                format!(" {:>9}", human_bytes(e.size)),
+                Style::default().fg(Color::White),
+            ));
+            if e.is_dir {
+                spans.push(Span::styled(
+                    format!(" {} files", e.file_count),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            let pct = if listing.total_size == 0 {
+                0
+            } else {
+                ((e.size as f64 / listing.total_size as f64) * 100.0).round() as u64
+            };
+            spans.push(Span::styled(
+                format!(" {pct:3}%"),
+                Style::default().fg(Color::DarkGray),
+            ));
+            lines.push(Line::from(spans));
         }
     }
 
