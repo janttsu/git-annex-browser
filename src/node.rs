@@ -7,6 +7,7 @@ Similar structure to zfs-browser: everything is a Node.
 use crate::annex::{
     AnnexMetadata, AnnexedFile, DriveProfile, Remote, TrustLevel, parse_size_from_key,
 };
+use crate::usage::{UsageDirNode, UsageListing};
 use crate::util::{fmt_unix, human_bytes, short_uuid};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -42,6 +43,21 @@ pub trait Node {
     }
     /// Fully loaded repo node for this annex path (not the summary placeholder).
     fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+    /// Annex size for ncdu-style listings (git-annex key size, not the filesystem).
+    fn size(&self) -> Option<u64> {
+        None
+    }
+    /// Whether annexed content is present on this repo (`here`).
+    fn present(&self) -> Option<bool> {
+        None
+    }
+    /// Index to select after descending into this node (ncdu skips `..`).
+    fn initial_selected(&self) -> usize {
+        0
+    }
+    fn usage_listing(&self) -> Option<UsageListing> {
         None
     }
 }
@@ -278,11 +294,11 @@ impl Node for RepoNode {
         Some(&self.meta.root)
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
-        // Lead with drives so you immediately see presence on all disks
         let mut kids: Vec<Rc<dyn Node>> = vec![
             Rc::new(RepoVisualNode {
                 root: self.meta.root.clone(),
             }),
+            Rc::new(UsageDirNode::root(Rc::clone(&self.meta))),
             Rc::new(DrivesNode {
                 meta: Rc::clone(&self.meta),
                 drive_profiles: Rc::clone(&self.drive_profiles),
@@ -322,6 +338,8 @@ impl Node for RepoNode {
                 human_bytes(m.consumed_size)
             ),
             format!("known remotes/drives: {}", m.remotes.len()),
+            "Open 'disk usage' for an ncdu-style tree (largest first; sizes from git-annex keys)."
+                .into(),
         ];
         if let Some(h) = m.remotes.get(&m.uuid) {
             d.push(format!("here present: {} keys", h.present_count));

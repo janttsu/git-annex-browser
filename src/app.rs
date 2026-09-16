@@ -6,6 +6,7 @@ The heavy data lives on the worker thread.
 
 use crate::annex::{self, AnnexMetadata, RepoSummary, aggregate_remote_usage};
 use crate::node::{Node, RepoLoadingNode, RepoNode, RootNode};
+use crate::usage::UsageListing;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -97,6 +98,8 @@ impl App {
                     anomalous: n.anomalous(),
                     trust: n.trust(),
                     repo_name,
+                    size: n.size(),
+                    missing: n.present() == Some(false),
                 }
             })
             .collect();
@@ -117,6 +120,7 @@ impl App {
             .iter()
             .map(VisualRepoDetail::from_summary)
             .collect();
+        let usage = selected_node.as_ref().and_then(|n| n.usage_listing());
 
         ViewSnapshot {
             crumb,
@@ -126,6 +130,7 @@ impl App {
             raw,
             visual,
             repo_visuals,
+            usage,
             status: self.status.clone(),
             total_repos: if let Some(r) = self.stack.first() {
                 r.node
@@ -191,7 +196,11 @@ impl App {
                     && child.kind() != "report"
                     && child.kind() != "viz"
                 {
-                    if let Some(p) = child.annex_repo_path() {
+                    if child.kind() == "parent" {
+                        if self.stack.len() > 1 {
+                            self.stack.pop();
+                        }
+                    } else if let Some(p) = child.annex_repo_path() {
                         if let Some(meta) = self.preloaded.get(p).cloned() {
                             // Instant because of bg pre-scan or cache
                             let profiles = Rc::clone(&self.drive_profiles);
@@ -209,9 +218,10 @@ impl App {
                             });
                         }
                     } else {
+                        let selected = child.initial_selected();
                         self.stack.push(Level {
                             node: Rc::clone(child),
-                            selected: 0,
+                            selected,
                         });
                     }
                 }
@@ -410,6 +420,7 @@ pub struct ViewSnapshot {
     pub raw: Option<String>,
     pub visual: Option<VisualReport>,
     pub repo_visuals: Vec<VisualRepoDetail>,
+    pub usage: Option<UsageListing>,
     pub status: String,
     pub total_repos: usize,
     pub scanning: bool,
@@ -424,6 +435,10 @@ pub struct ListItem {
     pub trust: Option<crate::annex::TrustLevel>,
     /// Short annex name, when this row is a repo or per-repo visual.
     pub repo_name: Option<String>,
+    /// git-annex size for ncdu-style rows (not filesystem size).
+    pub size: Option<u64>,
+    /// True when annexed content is not present on this repo.
+    pub missing: bool,
 }
 
 /// Live dashboard for the global report (bars + copy-health).

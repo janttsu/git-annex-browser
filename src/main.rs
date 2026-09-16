@@ -12,6 +12,7 @@ mod annex;
 mod app;
 mod node;
 mod ui;
+mod usage;
 mod util;
 mod worker;
 
@@ -453,6 +454,11 @@ fn apply_background_snapshot(
                 incoming.raw
             } else {
                 cur.raw.clone()
+            };
+            cur.usage = if selected_matches {
+                incoming.usage
+            } else {
+                cur.usage.clone()
             };
             cur.selected = sel;
         }

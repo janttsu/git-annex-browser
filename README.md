@@ -15,7 +15,7 @@ All this information is available via normal `git annex` commands, but querying 
 
 **Binary name:** `git-annex-browser`
 
-Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, per-key location logs, and so on) plus `git annex find`. Location logs include untrusted remotes (e.g. Glacier), so used-storage figures update after `git annex copy --to` without a slow `whereis --all`. The TUI itself is view-only.
+Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, per-key location logs, and so on) plus `git annex find --branch HEAD --anything`. File sizes come from annex keys (`bytesize`), not the filesystem, so dropped or missing working-tree files still appear. Location logs include untrusted remotes (e.g. Glacier), so used-storage figures update after `git annex copy --to` without a slow `whereis --all`. The TUI itself is view-only.
 
 ## Features
 - Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees).
@@ -24,6 +24,7 @@ Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group
   - **Drives / remotes** list with type, trust (`T`/`?`/`U`/`D`, colored), present key counts, last fsck
   - Files present on a specific drive (including here), from cached location data so offline drives stay browsable
   - All annexed files in the working tree, each annotated with short presence badges
+  - **Disk usage** (ncdu-style): directories and files sorted largest-first, with size bars. Sizes are from git-annex keys, so this works when content is not present here
 - For each file: locations (trusted and untrusted copies) + key + size
 - The TUI shows the cache immediately, then re-scans every annex in the background and refreshes the view (and cache) as each repo finishes
 - Global report includes unique vs total-with-copies size, plus storage per special remote (rclone etc.; other annex clones are omitted)
@@ -47,7 +48,7 @@ git-annex-browser [OPTIONS] [DIR]
 
 `--scan` and `--dump` **merge** into the cache: repos under `DIR` are updated or removed if they disappeared; cached repos outside `DIR` are left alone.
 
-Descend into a repo → drives → files on that drive. `r` / `F5` re-scans from disk.
+Descend into a repo → disk usage (largest dirs/files) or drives → files on that drive. `r` / `F5` re-scans from disk.
 
 Keys:
 ```
@@ -107,7 +108,8 @@ git-annex-browser --scan --quiet /path/with/annexes
 ## Notes
 - View only: no `git annex get` / `drop` / `trust`.
 - Nested annexes inside another annex working tree are not discovered (the parent annex is a prune point).
-- Very large annexes (>50k files) still materialize the file tree when you open "all files" or a drive's file list; prefer drive-specific views and `/` filter.
+- Very large annexes (>50k files) still materialize the file tree when you open "disk usage", "all files", or a drive's file list; prefer drive-specific views and `/` filter.
+- Disk usage counts each path's annex size (like ncdu apparent size). Content does not need to exist on this clone.
 - Drive file lists use cached location-log data, not a live `git annex list`.
 
 ## Future Ideas

@@ -275,17 +275,7 @@ impl AnnexMetadata {
         }
         let key_sizes = collect_key_sizes(&self.files, &self.locations);
         if need_totals {
-            let mut u = 0u64;
-            let mut c = 0u64;
-            for (key, uuids) in &self.locations {
-                if uuids.is_empty() {
-                    continue;
-                }
-                if let Some(&sz) = key_sizes.get(key) {
-                    u += sz;
-                    c += sz * (uuids.len() as u64);
-                }
-            }
+            let (u, c) = size_totals(&self.locations, &key_sizes);
             self.unique_size = u;
             self.consumed_size = c;
         }
@@ -938,6 +928,24 @@ fn collect_key_sizes(
     key_sizes
 }
 
+fn size_totals(
+    locations: &HashMap<String, HashSet<String>>,
+    key_sizes: &HashMap<String, u64>,
+) -> (u64, u64) {
+    let mut unique_size = 0u64;
+    let mut consumed_size = 0u64;
+    for (key, uuids) in locations {
+        if uuids.is_empty() {
+            continue;
+        }
+        if let Some(&sz) = key_sizes.get(key) {
+            unique_size += sz;
+            consumed_size += sz * (uuids.len() as u64);
+        }
+    }
+    (unique_size, consumed_size)
+}
+
 fn apply_present_stats(
     remotes: &mut HashMap<String, Remote>,
     locations: &HashMap<String, HashSet<String>>,
@@ -1027,6 +1035,161 @@ pub fn get_live_locations_for_key(repo: &Path, key: &str) -> Result<HashSet<Stri
         present.extend(locs);
     }
     Ok(present)
+}
+
+/// Parse `git annex find --format='${file}\000${key}\000${bytesize}\000'` output.
+pub fn parse_find_nul_triplets(buf: &[u8]) -> Vec<AnnexedFile> {
+    let mut out = Vec::new();
+    let mut fields = buf.split(|&b| b == 0);
+    while let Some(path_b) = fields.next() {
+        if path_b.is_empty() {
+            break;
+        }
+        let Some(key_b) = fields.next() else {
+            break;
+        };
+        let Some(size_b) = fields.next() else {
+            break;
+        };
+        let path = String::from_utf8_lossy(path_b).into_owned();
+        let key = String::from_utf8_lossy(key_b).into_owned();
+        if path.is_empty() || key.is_empty() {
+            continue;
+        }
+        let parsed = std::str::from_utf8(size_b)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0);
+        let size = parsed.or_else(|| parse_size_from_key(&key));
+        out.push(AnnexedFile { path, key, size });
+    }
+    out
+}
+
+fn find_files_with_format(root: &Path, use_branch: bool) -> Option<Vec<AnnexedFile>> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).arg("annex").arg("find");
+    if use_branch {
+        cmd.arg("--branch").arg("HEAD");
+    }
+    let out = cmd
+        .arg("--anything")
+        .arg("--format=${file}\\000${key}\\000${bytesize}\\000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    if out.stdout.is_empty() {
+        return Some(Vec::new());
+    }
+    if !out.stdout.contains(&0) {
+        return None;
+    }
+    Some(parse_find_nul_triplets(&out.stdout))
+}
+
+fn find_annexed_paths(root: &Path) -> Vec<String> {
+    let attempts: &[&[&str]] = &[
+        &[
+            "annex",
+            "find",
+            "--branch",
+            "HEAD",
+            "--anything",
+            "--print0",
+        ],
+        &["annex", "find", "--anything", "--print0"],
+        &["annex", "find", "--print0"],
+    ];
+    for args in attempts {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(*args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let Ok(out) = out else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let mut v = Vec::new();
+        for p in out.stdout.split(|&b| b == 0) {
+            if !p.is_empty() {
+                v.push(String::from_utf8_lossy(p).into_owned());
+            }
+        }
+        return v;
+    }
+    Vec::new()
+}
+
+fn lookup_keys_for_paths(root: &Path, paths: &[String]) -> Vec<AnnexedFile> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let mut child = match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("annex")
+        .arg("lookupkey")
+        .arg("--batch")
+        .arg("-z")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    {
+        let Some(mut stdin) = child.stdin.take() else {
+            return Vec::new();
+        };
+        for p in paths {
+            if stdin.write_all(p.as_bytes()).is_err() || stdin.write_all(&[0]).is_err() {
+                break;
+            }
+        }
+    }
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.wait();
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    let reader = BufReader::new(stdout);
+    for (i, line_res) in reader.lines().enumerate() {
+        if let Ok(key) = line_res
+            && i < paths.len()
+            && !key.is_empty()
+        {
+            let path = paths[i].clone();
+            let size = parse_size_from_key(&key);
+            files.push(AnnexedFile { path, key, size });
+        }
+    }
+    let _ = child.wait();
+    files
+}
+
+/// All annexed files recorded in git, with sizes from git-annex (not the filesystem).
+///
+/// Prefers `git annex find --branch HEAD --anything` so files still appear when
+/// their content is dropped or the working-tree symlink is missing.
+pub fn load_annexed_files(root: &Path) -> Vec<AnnexedFile> {
+    if let Some(files) = find_files_with_format(root, true) {
+        return files;
+    }
+    if let Some(files) = find_files_with_format(root, false) {
+        return files;
+    }
+    lookup_keys_for_paths(root, &find_annexed_paths(root))
 }
 
 /// Load full metadata for one annex repo. May be slow on huge annex; called on worker.
@@ -1197,64 +1360,9 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // (kept for internal use / old caches, but not shown in UI by default)
     fill_drive_spaces(&root, &uuid, &mut remotes);
 
-    // Load files + keys + locations
-    let annexed_paths = {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("annex")
-            .arg("find")
-            .arg("--print0")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()?;
-        if out.status.success() {
-            let mut v = vec![];
-            for p in out.stdout.split(|&b| b == 0) {
-                if !p.is_empty() {
-                    v.push(String::from_utf8_lossy(p).to_string());
-                }
-            }
-            v
-        } else {
-            vec![]
-        }
-    };
-
-    // Batch lookup keys for paths
-    let mut files: Vec<AnnexedFile> = vec![];
-    if !annexed_paths.is_empty() {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .arg("annex")
-            .arg("lookupkey")
-            .arg("--batch")
-            .arg("-z")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
-        {
-            let mut stdin = child.stdin.take().unwrap();
-            for p in &annexed_paths {
-                stdin.write_all(p.as_bytes())?;
-                stdin.write_all(&[0])?;
-            }
-        }
-        let stdout = child.stdout.take().unwrap();
-        let reader = BufReader::new(stdout);
-        for (i, line_res) in reader.lines().enumerate() {
-            if let Ok(key) = line_res
-                && i < annexed_paths.len()
-            {
-                let path = annexed_paths[i].clone();
-                let size = parse_size_from_key(&key);
-                files.push(AnnexedFile { path, key, size });
-            }
-        }
-        let _ = child.wait();
-    }
+    // Working-tree / HEAD annexed files. Sizes come from git-annex (key / bytesize),
+    // so dropped or missing content is still listed.
+    let files = load_annexed_files(&root);
 
     // Presence from git-annex branch location logs (includes untrusted remotes
     // such as Glacier). `whereis --json --all` is too slow on large annexes and
@@ -1264,18 +1372,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let total_keys = locations.len().max(files.len());
     let key_sizes = collect_key_sizes(&files, &locations);
     apply_present_stats(&mut remotes, &locations, &key_sizes);
-
-    let mut unique_size = 0u64;
-    let mut consumed_size = 0u64;
-    for (key, uuids) in &locations {
-        if uuids.is_empty() {
-            continue;
-        }
-        if let Some(&sz) = key_sizes.get(key) {
-            unique_size += sz;
-            consumed_size += sz * (uuids.len() as u64);
-        }
-    }
+    let (unique_size, consumed_size) = size_totals(&locations, &key_sizes);
 
     // Fill local desc if empty
     let description = if desc.is_empty() {
@@ -2009,5 +2106,95 @@ here-uuid 1 timestamp=125s
         let meta = load_metadata(p).expect("load demo");
         assert!(!meta.uuid.is_empty());
         assert!(!meta.remotes.is_empty());
+    }
+
+    #[test]
+    fn parse_find_nul_triplets_uses_bytesize_and_key_fallback() {
+        let mut buf = Vec::new();
+        buf.extend(b"videos/big.mkv\0SHA256E-s50000--abcd.mkv\0");
+        buf.extend(b"50000\0");
+        buf.extend(b"photos/x.jpg\0SHA256E-s12--ef.jpg\0\0"); // empty bytesize -> key
+        buf.extend(b"url.dat\0URL--http://x\0");
+        buf.extend(b"0\0"); // 0 bytesize, no size in key
+        let files = parse_find_nul_triplets(&buf);
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].path, "videos/big.mkv");
+        assert_eq!(files[0].size, Some(50000));
+        assert_eq!(files[1].path, "photos/x.jpg");
+        assert_eq!(files[1].size, Some(12));
+        assert_eq!(files[2].path, "url.dat");
+        assert_eq!(files[2].size, None);
+    }
+
+    fn annex_available() -> bool {
+        Command::new("git")
+            .arg("annex")
+            .arg("version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    fn chmod_u_write(path: &Path) {
+        let _ = Command::new("chmod").args(["-R", "u+w"]).arg(path).status();
+    }
+
+    #[test]
+    fn load_annexed_files_includes_dropped_and_missing_with_annex_size() {
+        if !annex_available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "gab-ncdu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        mkdir(&root);
+        let init = || {
+            let git = |args: &[&str]| {
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .unwrap()
+            };
+            assert!(git(&["init", "-q"]).success());
+            assert!(git(&["config", "user.email", "t@t"]).success());
+            assert!(git(&["config", "user.name", "t"]).success());
+            assert!(git(&["annex", "init", "-q", "testdemo"]).success());
+            mkdir(&root.join("videos/clips"));
+            mkdir(&root.join("photos"));
+            std::fs::write(root.join("photos/small.jpg"), vec![b'x'; 1000]).unwrap();
+            std::fs::write(root.join("videos/big.mkv"), vec![b'y'; 50000]).unwrap();
+            std::fs::write(root.join("videos/clips/mid.bin"), vec![b'z'; 8000]).unwrap();
+            assert!(git(&["annex", "add", "-q", "photos", "videos"]).success());
+            assert!(git(&["commit", "-q", "-m", "add"]).success());
+            assert!(git(&["annex", "drop", "--force", "-q", "videos/big.mkv"]).success());
+            let _ = std::fs::remove_file(root.join("photos/small.jpg"));
+        };
+        init();
+        let files = load_annexed_files(&root);
+        let meta = load_metadata(&root);
+        chmod_u_write(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let by_path: HashMap<_, _> = files.iter().map(|f| (f.path.as_str(), f)).collect();
+        assert_eq!(
+            by_path.len(),
+            3,
+            "files: {:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
+        assert_eq!(by_path["videos/big.mkv"].size, Some(50000));
+        assert_eq!(by_path["photos/small.jpg"].size, Some(1000));
+        assert_eq!(by_path["videos/clips/mid.bin"].size, Some(8000));
+        assert_eq!(meta.expect("load_metadata").files.len(), 3);
     }
 }
