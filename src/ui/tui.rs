@@ -46,6 +46,7 @@ Focus on drives (special remotes), trust, last fsck, groups/wanted, numcopies, f
   Enter on the report (or z) zooms it full screen; h/z back.
   Disk usage (inside a repo): ncdu-style listing, largest dirs/files first.
   Sizes come from git-annex keys, so dropped or missing content still counts.
+  Remotes marked git annex dead are omitted from lists and totals.
 "#;
 
 pub const LIST_CHROME_ROWS: u16 = 2;
