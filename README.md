@@ -21,7 +21,7 @@ Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group
 - Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees).
 - Per-repo view of:
   - Summary (uuid, counts, trust breakdown, last fsck)
-  - **Drives / remotes** list with type, trust (`T`/`?`/`U`/`D`, colored), present key counts, last fsck
+  - **Drives / remotes** list with type, trust (`T`/`?`/`U`, colored), present key counts, last fsck. Remotes marked `git annex dead` are omitted.
   - Files present on a specific drive (including here), from cached location data so offline drives stay browsable
   - All annexed files in the working tree, each annotated with short presence badges
   - **Disk usage** (ncdu-style): directories and files sorted largest-first, with size bars. Sizes are from git-annex keys, so this works when content is not present here
@@ -111,6 +111,7 @@ git-annex-browser --scan --quiet /path/with/annexes
 - Very large annexes (>50k files) still materialize the file tree when you open "disk usage", "all files", or a drive's file list; prefer drive-specific views and `/` filter.
 - Disk usage counts each path's annex size (like ncdu apparent size). Content does not need to exist on this clone.
 - Drive file lists use cached location-log data, not a live `git annex list`.
+- Remotes marked `git annex dead` are dropped from metadata: they do not appear in drive lists, file locations, visual bars, or used-storage totals (stale location-log rows would otherwise keep retired clones visible).
 
 ## Future Ideas
 - Opt-in write support (`git annex trust`, copy hints).

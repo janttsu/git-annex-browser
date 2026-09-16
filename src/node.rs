@@ -875,6 +875,7 @@ impl Node for AnnexFileNode {
                 locs = live;
             }
         }
+        locs.retain(|u| self.meta.remotes.contains_key(u));
         if !locs.is_empty() {
             d.push(format!("present on {} locations:", locs.len()));
             let mut sorted: Vec<_> = locs.into_iter().collect();

@@ -262,8 +262,27 @@ impl AnnexMetadata {
         }
     }
 
+    /// Drop remotes marked `git annex dead` (except this clone) and recount.
+    /// Location logs often still list keys on retired machines; those rows
+    /// inflate drive lists and consumed-size totals.
+    pub fn omit_dead_remotes(&mut self) {
+        if drop_dead_remotes(&self.uuid, &mut self.remotes, &mut self.locations) {
+            self.recount_presence();
+        }
+    }
+
+    fn recount_presence(&mut self) {
+        let key_sizes = collect_key_sizes(&self.files, &self.locations);
+        apply_present_stats(&mut self.remotes, &self.locations, &key_sizes);
+        let (unique_size, consumed_size) = size_totals(&self.locations, &key_sizes);
+        self.unique_size = unique_size;
+        self.consumed_size = consumed_size;
+        self.total_keys = self.locations.len().max(self.files.len());
+    }
+
     /// Ensure size stats are populated (for old caches that didn't have them)
     pub fn ensure_sizes(&mut self) {
+        self.omit_dead_remotes();
         let need_totals =
             self.unique_size == 0 && self.consumed_size == 0 && !self.locations.is_empty();
         let need_remote = self
@@ -946,6 +965,28 @@ fn size_totals(
     (unique_size, consumed_size)
 }
 
+/// Remove remotes marked dead (except `here`). Returns true if anything was dropped.
+fn drop_dead_remotes(
+    here: &str,
+    remotes: &mut HashMap<String, Remote>,
+    locations: &mut HashMap<String, HashSet<String>>,
+) -> bool {
+    let dead: HashSet<String> = remotes
+        .iter()
+        .filter(|(uuid, r)| r.trust == TrustLevel::Dead && *uuid != here)
+        .map(|(uuid, _)| uuid.clone())
+        .collect();
+    if dead.is_empty() {
+        return false;
+    }
+    remotes.retain(|uuid, _| !dead.contains(uuid));
+    for locs in locations.values_mut() {
+        locs.retain(|u| !dead.contains(u));
+    }
+    locations.retain(|_, locs| !locs.is_empty());
+    true
+}
+
 fn apply_present_stats(
     remotes: &mut HashMap<String, Remote>,
     locations: &HashMap<String, HashSet<String>>,
@@ -1367,7 +1408,8 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Presence from git-annex branch location logs (includes untrusted remotes
     // such as Glacier). `whereis --json --all` is too slow on large annexes and
     // left used-storage figures stale after `copy --to` Glacier.
-    let locations = load_locations_from_branch(&root);
+    let mut locations = load_locations_from_branch(&root);
+    drop_dead_remotes(&uuid, &mut remotes, &mut locations);
 
     let total_keys = locations.len().max(files.len());
     let key_sizes = collect_key_sizes(&files, &locations);
@@ -2051,6 +2093,111 @@ u2 something else timestamp=9s
         // numcopies=1: only-glacier is under (untrusted doesn't count), others ok/over
         assert_eq!(copy_health_counts(&loc, 1, &remotes), (1, 1, 1));
         assert_eq!(copy_health_counts(&loc, 2, &remotes), (2, 1, 0));
+    }
+
+    fn remote(uuid: &str, trust: TrustLevel) -> Remote {
+        Remote {
+            uuid: uuid.into(),
+            description: uuid.into(),
+            config: HashMap::new(),
+            trust,
+            last_fsck: None,
+            present_count: 0,
+            present_size: 0,
+            available_space: None,
+            groups: vec![],
+            wanted: None,
+            required: None,
+        }
+    }
+
+    #[test]
+    fn omit_dead_remotes_strips_them_from_data_and_totals() {
+        let mut remotes = HashMap::new();
+        remotes.insert("here".into(), remote("here", TrustLevel::Trusted));
+        remotes.insert("disk".into(), remote("disk", TrustLevel::SemiTrusted));
+        remotes.insert("old-laptop".into(), remote("old-laptop", TrustLevel::Dead));
+        let mut locations = HashMap::new();
+        locations.insert(
+            "SHA256E-s100--aa".into(),
+            HashSet::from(["here".into(), "old-laptop".into()]),
+        );
+        locations.insert(
+            "SHA256E-s50--bb".into(),
+            HashSet::from(["old-laptop".into()]),
+        );
+        locations.insert("SHA256E-s10--cc".into(), HashSet::from(["disk".into()]));
+        let mut meta = dummy_meta("/tmp/a");
+        meta.uuid = "here".into();
+        meta.remotes = remotes;
+        meta.locations = locations;
+        meta.omit_dead_remotes();
+
+        assert!(!meta.remotes.contains_key("old-laptop"));
+        assert!(meta.remotes.contains_key("here"));
+        assert!(meta.remotes.contains_key("disk"));
+        assert_eq!(
+            meta.locations.get("SHA256E-s100--aa").unwrap(),
+            &HashSet::from(["here".to_string()])
+        );
+        assert!(!meta.locations.contains_key("SHA256E-s50--bb"));
+        assert_eq!(meta.unique_size, 110);
+        assert_eq!(meta.consumed_size, 110);
+        assert_eq!(meta.remotes["here"].present_count, 1);
+        assert_eq!(meta.remotes["here"].present_size, 100);
+        assert_eq!(meta.remotes["disk"].present_size, 10);
+    }
+
+    #[test]
+    fn omit_dead_keeps_here_even_if_marked_dead() {
+        let mut remotes = HashMap::new();
+        remotes.insert("here".into(), remote("here", TrustLevel::Dead));
+        remotes.insert("gone".into(), remote("gone", TrustLevel::Dead));
+        let mut locations = HashMap::new();
+        locations.insert(
+            "SHA256E-s8--x".into(),
+            HashSet::from(["here".into(), "gone".into()]),
+        );
+        let mut meta = dummy_meta("/tmp/a");
+        meta.uuid = "here".into();
+        meta.remotes = remotes;
+        meta.locations = locations;
+        meta.omit_dead_remotes();
+        assert!(meta.remotes.contains_key("here"));
+        assert!(!meta.remotes.contains_key("gone"));
+        assert_eq!(meta.unique_size, 8);
+        assert_eq!(meta.consumed_size, 8);
+    }
+
+    #[test]
+    fn ensure_sizes_omits_dead_from_cached_metadata() {
+        let mut remotes = HashMap::new();
+        remotes.insert("here".into(), {
+            let mut r = remote("here", TrustLevel::Trusted);
+            r.present_count = 1;
+            r.present_size = 20;
+            r
+        });
+        remotes.insert("dead-box".into(), {
+            let mut r = remote("dead-box", TrustLevel::Dead);
+            r.present_count = 1;
+            r.present_size = 20;
+            r
+        });
+        let mut locations = HashMap::new();
+        locations.insert(
+            "SHA256E-s20--k".into(),
+            HashSet::from(["here".into(), "dead-box".into()]),
+        );
+        let mut meta = dummy_meta("/tmp/a");
+        meta.uuid = "here".into();
+        meta.remotes = remotes;
+        meta.locations = locations;
+        meta.unique_size = 20;
+        meta.consumed_size = 40;
+        meta.ensure_sizes();
+        assert!(!meta.remotes.contains_key("dead-box"));
+        assert_eq!(meta.consumed_size, 20);
     }
 
     #[test]
