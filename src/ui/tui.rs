@@ -929,3 +929,102 @@ fn copy_mini_counts(
         width,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use crate::testutil::sample_meta;
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+
+    fn render(ui: &UiState, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            draw(f, ui);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn ui_for(app: &App) -> UiState {
+        UiState {
+            snapshot: Some(app.snapshot()),
+            ..Default::default()
+        }
+    }
+
+    fn open(app: &mut App, needle: &str) {
+        let kids = app.stack.last().unwrap().node.children();
+        let i = kids
+            .iter()
+            .position(|k| k.label().contains(needle))
+            .unwrap_or_else(|| panic!("no row containing {needle:?}"));
+        app.execute(crate::app::Command::Select(i), 10);
+        app.execute(crate::app::Command::Descend, 10);
+    }
+
+    #[test]
+    fn root_view_shows_report_repo_and_status() {
+        let mut app = App::new(PathBuf::from("/data"));
+        app.set_discovered(&[PathBuf::from("/data/photos")], 1);
+        app.ingest_meta(sample_meta());
+        app.status = "ready".into();
+        let screen = render(&ui_for(&app), 120, 20);
+        assert!(screen.contains("Global report (all repos)"), "{screen}");
+        assert!(screen.contains("[repo] ↓ photos"), "{screen}");
+        assert!(screen.contains("visual report"), "{screen}");
+        assert!(screen.contains("ready"), "{screen}");
+    }
+
+    #[test]
+    fn narrow_status_line_keeps_status_and_drops_hints() {
+        let mut app = App::new(PathBuf::from("/data"));
+        app.status = "scanning 3/11…".into();
+        let ui = ui_for(&app);
+        let line = status_line(ui.snapshot.as_ref().unwrap(), &ui, 30);
+        assert!(line.starts_with("scanning 3/11…"));
+        assert!(line.width() <= 30, "{line}");
+        let wide = status_line(ui.snapshot.as_ref().unwrap(), &ui, 200);
+        assert!(wide.contains("r refresh"));
+    }
+
+    #[test]
+    fn disk_usage_view_lists_largest_first() {
+        let mut app = App::new(PathBuf::from("/data"));
+        app.set_discovered(&[PathBuf::from("/data/photos")], 1);
+        app.ingest_meta(sample_meta());
+        open(&mut app, "photos");
+        open(&mut app, "disk usage");
+        let screen = render(&ui_for(&app), 120, 16);
+        let big = screen.find("2024/").expect("2024 dir listed");
+        let small = screen.find("notes.txt").expect("notes listed");
+        assert!(big < small, "{screen}");
+    }
+
+    #[test]
+    fn help_overlay_renders() {
+        let ui = UiState {
+            snapshot: Some(App::new(PathBuf::from("/d")).snapshot()),
+            show_help: true,
+            ..Default::default()
+        };
+        assert!(render(&ui, 110, 30).contains("never quits"));
+    }
+
+    #[test]
+    fn trunc_name_uses_display_width() {
+        assert_eq!(trunc_name("abc", 5), "abc  ");
+        assert_eq!(trunc_name("abcdef", 4), "abc…");
+        let wide = trunc_name("写真フォルダ", 7);
+        assert_eq!(wide.width(), 7, "{wide:?}");
+    }
+}

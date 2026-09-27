@@ -380,3 +380,79 @@ impl Worker {
         let _ = self.out.send(WorkerOut::Background(self.app.snapshot()));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn config(root: &std::path::Path, cache: &std::path::Path, offline: bool) -> WorkerConfig {
+        WorkerConfig {
+            scan_root: root.to_path_buf(),
+            discover: DiscoverOptions::default(),
+            cache: Cache::at(cache.to_path_buf()),
+            jobs: 2,
+            offline,
+            force_rescan: false,
+        }
+    }
+
+    /// Wait for a background snapshot matching `done`, failing after 60 s.
+    fn wait_for(rx: &Receiver<WorkerOut>, done: impl Fn(&ViewSnapshot) -> bool) -> ViewSnapshot {
+        let start = Instant::now();
+        loop {
+            let left = Duration::from_secs(60).saturating_sub(start.elapsed());
+            match rx.recv_timeout(left) {
+                Ok(WorkerOut::Background(s) | WorkerOut::Nav(s)) if done(&s) => return s,
+                Ok(_) => {}
+                Err(e) => panic!("worker did not finish: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn scans_real_annex_caches_it_and_reopens_offline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repos = tmp.path().join("repos");
+        let Some(root) = crate::testutil::real_annex(&repos, "photos") else {
+            return;
+        };
+        let cache_dir = tmp.path().join("cache");
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (handle, rx, join) = spawn(config(&repos, &cache_dir, false), Arc::clone(&cancel));
+        let snap = wait_for(&rx, |s| !s.scanning && s.status.contains("cache updated"));
+        assert_eq!(snap.total_repos, 1);
+        let row = snap
+            .list
+            .iter()
+            .find(|r| r.label.starts_with("photos"))
+            .unwrap();
+        assert!(row.label.contains("3 files"), "{}", row.label);
+
+        // Descend into the repo: the reply is the loaded repo menu.
+        let idx = snap
+            .list
+            .iter()
+            .position(|r| r.label.starts_with("photos"))
+            .unwrap();
+        assert!(handle.send(WorkerMsg::Nav(Command::Select(idx), 10)));
+        assert!(handle.send(WorkerMsg::Nav(Command::Descend, 10)));
+        let menu = wait_for(&rx, |s| s.crumb.len() == 2);
+        assert!(menu.list.iter().any(|r| r.label.starts_with("disk usage")));
+
+        handle.send(WorkerMsg::Nav(Command::Quit, 0));
+        join.join().unwrap();
+        let idx = Cache::at(cache_dir.clone()).load_index();
+        assert!(idx.get(&root).is_some(), "repo was written to the cache");
+
+        // Offline start: repo comes from the cache alone.
+        let (handle, rx, join) = spawn(config(&repos, &cache_dir, true), cancel);
+        let snap = wait_for(&rx, |s| !s.scanning);
+        assert_eq!(snap.total_repos, 1);
+        assert!(snap.status.contains("offline"), "{}", snap.status);
+        handle.send(WorkerMsg::Nav(Command::Quit, 0));
+        join.join().unwrap();
+        crate::testutil::make_writable(tmp.path());
+    }
+}
