@@ -4,9 +4,13 @@
 
 ![Global report](assets/main-view.png)
 
-![Drives view](assets/drives-view.png)
+![Drives view: usb-archive is red because its trust differs from the other repos](assets/drives-view.png)
 
-![Files view](assets/files-view.png)
+![Disk usage from git-annex key sizes](assets/usage-view.png)
+
+![Missing here: which drives to connect](assets/missing-here-view.png)
+
+![At-risk files with their locations](assets/files-view.png)
 
 A [Crossterm](https://github.com/crossterm-rs/crossterm) +
 [Ratatui](https://ratatui.rs) terminal UI for exploring git-annex repositories.
@@ -134,6 +138,16 @@ git-annex-browser --dump --json --quiet /path/with/annexes | jq '.repos[] | {nam
 ### Prebuilt binaries
 
 Tagged releases (`v*`) attach Linux and macOS binaries with SHA-256 checksums to the GitHub release.
+
+## Screenshots
+
+The images above are real screens from a throwaway Arch Linux VM, not mock-ups. `scripts/screenshots/run.sh` boots the VM with qemu/KVM, builds this repository's committed source inside it, and creates a demo collection with ordinary git-annex commands (`scripts/screenshots/demo-data.sh`). It then drives the TUI in xterm and saves the VM's display with qemu's `screendump`.
+
+```sh
+scripts/screenshots/run.sh            # writes assets/*-view.png
+```
+
+It needs `qemu-system-x86_64` with KVM, `qemu-img`, `xorriso`, `ssh` and `python3`. The Arch cloud image is cached in `~/.cache/git-annex-browser-vm/` and checked against the official SHA-256. Set `IMAGE_URL` or `PACMAN_MIRROR` to use a faster mirror.
 
 ## Notes
 - View only: no `git annex get` / `drop` / `trust`.
