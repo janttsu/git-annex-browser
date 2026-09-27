@@ -166,6 +166,9 @@ pub struct AnnexMetadata {
     /// Total storage consumed across all drives (size × number of copies)
     #[serde(default)]
     pub consumed_size: u64,
+    /// Refs this load was made from; used to skip unchanged repos.
+    #[serde(default)]
+    pub fingerprint: Option<RepoFingerprint>,
 }
 
 /// Lightweight summary for fast top-level listing and caching.
@@ -441,30 +444,164 @@ fn resolve_git_dir(path: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Directory holding shared refs and objects. Linked worktrees point to it via `commondir`.
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(s) => {
+            let p = PathBuf::from(s.trim());
+            if p.is_absolute() { p } else { git_dir.join(p) }
+        }
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
+/// Result of reading a ref straight from the filesystem.
+#[derive(Debug, PartialEq, Eq)]
+enum RefLookup {
+    Found(String),
+    Absent,
+    /// Could not tell (unreadable files, reftable, …); ask git.
+    Unknown,
+}
+
+/// Look up `name` (e.g. `refs/heads/git-annex`) in loose refs, then `packed-refs`.
+fn read_ref(common: &Path, name: &str, depth: u8) -> RefLookup {
+    if depth > 4 {
+        return RefLookup::Unknown;
+    }
+    match std::fs::read_to_string(common.join(name)) {
+        Ok(s) => {
+            let s = s.trim();
+            return match s.strip_prefix("ref: ") {
+                Some(target) => read_ref(common, target.trim(), depth + 1),
+                None if !s.is_empty() => RefLookup::Found(s.to_string()),
+                None => RefLookup::Unknown,
+            };
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return RefLookup::Unknown,
+        Err(_) => {}
+    }
+    if common.join("reftable").exists() {
+        return RefLookup::Unknown;
+    }
+    match std::fs::read_to_string(common.join("packed-refs")) {
+        Ok(text) => {
+            for line in text.lines() {
+                if line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                if let Some((sha, refname)) = line.split_once(' ')
+                    && refname.trim() == name
+                {
+                    return RefLookup::Found(sha.to_string());
+                }
+            }
+            RefLookup::Absent
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => RefLookup::Absent,
+        Err(_) => RefLookup::Unknown,
+    }
+}
+
+/// `HEAD` of this work tree: symbolic refs are followed; an unborn branch is `Absent`.
+fn read_head(git_dir: &Path, common: &Path) -> RefLookup {
+    let Ok(head) = std::fs::read_to_string(git_dir.join("HEAD")) else {
+        return RefLookup::Unknown;
+    };
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(target) => read_ref(common, target.trim(), 0),
+        None if !head.is_empty() => RefLookup::Found(head.to_string()),
+        None => RefLookup::Unknown,
+    }
+}
+
 pub fn is_annex_repo(path: &Path) -> bool {
     let Some(git_dir) = resolve_git_dir(path) else {
         return false;
     };
-    if git_dir.join("annex").exists() {
+    let common = common_git_dir(&git_dir);
+    if git_dir.join("annex").exists() || common.join("annex").exists() {
         return true;
     }
-    Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("rev-parse")
-        .arg("--verify")
-        .arg("--quiet")
-        .arg("git-annex^{commit}")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    match read_ref(&common, "refs/heads/git-annex", 0) {
+        RefLookup::Found(_) => true,
+        RefLookup::Absent => false,
+        RefLookup::Unknown => Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--verify", "--quiet", "git-annex^{commit}"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success()),
+    }
 }
 
-pub fn find_annex_repos(root: &Path) -> Vec<PathBuf> {
+/// What a load of this repo depends on. Equal fingerprints mean a cached load is current.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepoFingerprint {
+    /// Commit of the local `git-annex` branch (location logs, trust, remotes…).
+    pub annex_branch: String,
+    /// Commit of `HEAD` (the annexed file list). Empty on an unborn branch.
+    pub head: String,
+    /// Newest mtime of `.git/config` and `.gitattributes` (numcopies, annex.* settings).
+    pub config_mtime: i64,
+}
+
+fn mtime_secs(p: &Path) -> Option<i64> {
+    let m = std::fs::metadata(p).ok()?.modified().ok()?;
+    Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
+}
+
+/// Cheap fingerprint from ref files; falls back to one `git rev-parse` when needed.
+pub fn repo_fingerprint(root: &Path) -> Option<RepoFingerprint> {
+    let git_dir = resolve_git_dir(root)?;
+    let common = common_git_dir(&git_dir);
+    let config_mtime = [common.join("config"), root.join(".gitattributes")]
+        .iter()
+        .filter_map(|p| mtime_secs(p))
+        .max()
+        .unwrap_or(0);
+    let branch = read_ref(&common, "refs/heads/git-annex", 0);
+    let head = read_head(&git_dir, &common);
+    let (annex_branch, head) = match (branch, head) {
+        (RefLookup::Found(b), RefLookup::Found(h)) => (b, h),
+        (RefLookup::Found(b), RefLookup::Absent) => (b, String::new()),
+        (RefLookup::Absent, _) => return None,
+        _ => {
+            let out = run_git(root, &["rev-parse", "git-annex", "HEAD"]).ok()?;
+            let mut lines = out.lines();
+            let b = lines.next()?.trim().to_string();
+            let h = lines.next().unwrap_or("").trim().to_string();
+            (b, h)
+        }
+    };
+    Some(RepoFingerprint {
+        annex_branch,
+        head,
+        config_mtime,
+    })
+}
+
+/// Limits for walking the scan root.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoverOptions {
+    /// Maximum directory depth below the root (None = unlimited).
+    pub max_depth: Option<usize>,
+    /// Do not cross into other mounted filesystems.
+    pub one_file_system: bool,
+}
+
+pub fn find_annex_repos(root: &Path, opts: &DiscoverOptions) -> Vec<PathBuf> {
     let mut repos = Vec::new();
-    let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    let mut walk = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .same_file_system(opts.one_file_system);
+    if let Some(d) = opts.max_depth {
+        walk = walk.max_depth(d);
+    }
+    let mut it = walk.into_iter();
     while let Some(entry) = it.next() {
         let Ok(e) = entry else {
             continue;
@@ -709,8 +846,29 @@ fn parse_location_log_line(line: &str) -> Option<(String, i64, bool)> {
     }
 }
 
-/// Presence map from git-annex branch location logs (includes untrusted remotes).
-fn load_locations_from_branch(root: &Path) -> Result<HashMap<String, HashSet<String>>> {
+/// Blobs of the git-annex branch that `load_metadata` reads.
+#[derive(Default)]
+struct BranchLogs {
+    /// Top-level logs by file name (`uuid.log`, `trust.log`, …).
+    named: HashMap<String, String>,
+    /// Per-key location logs: key -> UUIDs with content.
+    locations: HashMap<String, HashSet<String>>,
+}
+
+const NAMED_LOGS: &[&str] = &[
+    "uuid.log",
+    "remote.log",
+    "trust.log",
+    "activity.log",
+    "group.log",
+    "preferred-content.log",
+    "required-content.log",
+    "numcopies.log",
+];
+
+/// Read every log `load_metadata` needs with one `ls-tree` and one `cat-file --batch`.
+/// Location logs include untrusted remotes (e.g. Glacier); `whereis --all` would be far slower.
+fn read_branch_logs(root: &Path) -> Result<BranchLogs> {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -727,45 +885,65 @@ fn load_locations_from_branch(root: &Path) -> Result<HashMap<String, HashSet<Str
         );
     }
 
+    enum Target {
+        Named(String),
+        Location(String),
+    }
     let mut shas = Vec::new();
-    let mut keys = Vec::new();
+    let mut targets = Vec::new();
     for entry in out.stdout.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
         let Ok(s) = std::str::from_utf8(entry) else {
             continue;
         };
         let Some((meta, path)) = s.split_once('\t') else {
             continue;
         };
-        if !is_location_log_path(path) {
-            continue;
-        }
-        let Some(key) = location_log_key(path) else {
-            continue;
-        };
         let Some(sha) = meta.split_whitespace().nth(2) else {
             continue;
         };
+        let target = if NAMED_LOGS.contains(&path) {
+            Target::Named(path.to_string())
+        } else if is_location_log_path(path)
+            && let Some(key) = location_log_key(path)
+        {
+            Target::Location(key.to_string())
+        } else {
+            continue;
+        };
         shas.push(sha.to_string());
-        keys.push(key.to_string());
-    }
-    if shas.is_empty() {
-        return Ok(HashMap::new());
+        targets.push(target);
     }
 
-    Ok(cat_file_location_logs(root, shas, keys))
+    let mut logs = BranchLogs::default();
+    if shas.is_empty() {
+        return Ok(logs);
+    }
+    let blobs = cat_file_batch(root, shas)?;
+    logs.locations.reserve(targets.len());
+    for (target, blob) in targets.into_iter().zip(blobs) {
+        let Some(blob) = blob else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&blob);
+        match target {
+            Target::Named(name) => {
+                logs.named.insert(name, text.into_owned());
+            }
+            Target::Location(key) => {
+                let uuids = parse_location_log(&text);
+                if !uuids.is_empty() {
+                    logs.locations.insert(key, uuids);
+                }
+            }
+        }
+    }
+    Ok(logs)
 }
 
-/// `git cat-file --batch` the location-log blobs. A writer thread avoids
-/// deadlock when the pipe buffer fills before we start reading.
-fn cat_file_location_logs(
-    root: &Path,
-    shas: Vec<String>,
-    keys: Vec<String>,
-) -> HashMap<String, HashSet<String>> {
-    let mut child = match Command::new("git")
+/// `git cat-file --batch` for `shas`, in order. Missing objects are `None`.
+/// A writer thread avoids deadlock when the pipe buffer fills before we start reading.
+fn cat_file_batch(root: &Path, shas: Vec<String>) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["cat-file", "--batch"])
@@ -773,80 +951,70 @@ fn cat_file_location_logs(
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return HashMap::new();
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return HashMap::new();
-    };
+        .with_context(|| format!("{}: starting git cat-file", root.display()))?;
+    let mut stdin = child.stdin.take().context("cat-file stdin")?;
+    let stdout = child.stdout.take().context("cat-file stdout")?;
+    let n = shas.len();
 
     let writer = std::thread::spawn(move || {
+        let mut w = std::io::BufWriter::new(&mut stdin);
         for sha in shas {
-            if stdin.write_all(sha.as_bytes()).is_err() || stdin.write_all(b"\n").is_err() {
+            if w.write_all(sha.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
                 break;
             }
         }
+        let _ = w.flush();
     });
 
     let mut reader = BufReader::new(stdout);
-    let mut locations = HashMap::with_capacity(keys.len());
+    let mut blobs = Vec::with_capacity(n);
     let mut header = String::new();
     let mut nl = [0u8; 1];
-    for key in keys {
+    for _ in 0..n {
         header.clear();
-        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+        if reader.read_line(&mut header)? == 0 {
             break;
         }
         let header_trim = header.trim_end();
         if header_trim.ends_with("missing") {
+            blobs.push(None);
             continue;
         }
         let size: usize = header_trim
             .split_whitespace()
             .nth(2)
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+            .context("bad cat-file header")?;
         let mut buf = vec![0u8; size];
-        if size > 0 && reader.read_exact(&mut buf).is_err() {
-            break;
-        }
-        if reader.read_exact(&mut nl).is_err() {
-            break;
-        }
-        let uuids = parse_location_log(&String::from_utf8_lossy(&buf));
-        if !uuids.is_empty() {
-            locations.insert(key, uuids);
-        }
+        reader.read_exact(&mut buf)?;
+        reader.read_exact(&mut nl)?;
+        blobs.push(Some(buf));
     }
     drop(reader);
-    let _ = child.wait();
     let _ = writer.join();
-    locations
+    let status = child.wait()?;
+    if blobs.len() != n {
+        anyhow::bail!(
+            "{}: git cat-file returned {} of {} objects ({status})",
+            root.display(),
+            blobs.len(),
+            n
+        );
+    }
+    Ok(blobs)
 }
 
 /// mtime of the git-annex branch ref (or packed-refs). Used to hydrate recently
 /// updated repos first so Glacier copies show up without waiting for the whole scan.
 pub fn annex_branch_mtime(root: &Path) -> Option<i64> {
-    let git_dir = resolve_git_dir(root)?;
-    let candidates = [
-        git_dir.join("refs/heads/git-annex"),
-        git_dir.join("packed-refs"),
-    ];
-    let mut best: Option<i64> = None;
-    for p in candidates {
-        if let Ok(meta) = std::fs::metadata(p)
-            && let Ok(modified) = meta.modified()
-            && let Ok(d) = modified.duration_since(std::time::UNIX_EPOCH)
-        {
-            let secs = d.as_secs() as i64;
-            best = Some(best.map_or(secs, |b| b.max(secs)));
-        }
-    }
-    best
+    let common = common_git_dir(&resolve_git_dir(root)?);
+    [
+        common.join("refs/heads/git-annex"),
+        common.join("packed-refs"),
+    ]
+    .iter()
+    .filter_map(|p| mtime_secs(p))
+    .max()
 }
 
 /// numcopies.log / mincopies.log: `timestamp number` (timestamp-first).
@@ -1124,61 +1292,79 @@ pub fn load_annexed_files(root: &Path) -> Vec<AnnexedFile> {
     lookup_keys_for_paths(root, &find_annexed_paths(root))
 }
 
-/// Load full metadata for one annex repo. May be slow on huge annex; called on worker.
+/// `annex.*` git config in one call. Keys are lowercase (`annex.uuid`).
+fn read_annex_config(root: &Path) -> Result<Vec<(String, String)>> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get-regexp", "^annex\\."])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("{}: running git config", root.display()))?;
+    // Exit 1 means "no matching keys", which the uuid check below reports.
+    if !out.status.success() && out.status.code() != Some(1) {
+        anyhow::bail!(
+            "{}: git config failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| {
+            let (k, v) = l.split_once(' ').unwrap_or((l, ""));
+            (k.to_string(), v.trim().to_string())
+        })
+        .collect())
+}
+
+/// Load full metadata for one annex repo. May be slow on huge annex; called off the UI thread.
+///
+/// Runs about four git processes: `config`, `ls-tree`, `cat-file --batch` and `annex find`.
 pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let root = repo.to_path_buf();
+    let fingerprint = repo_fingerprint(&root);
 
-    // Basic config. A missing uuid means git failed or the annex is not initialised;
-    // returning empty metadata would overwrite a good cache entry with zeros.
-    let uuid = run_git(&root, &["config", "--get", "annex.uuid"])
-        .with_context(|| format!("{}: reading annex.uuid", root.display()))?
-        .trim()
-        .to_string();
+    let config = read_annex_config(&root)?;
+    let cfg = |k: &str| {
+        config
+            .iter()
+            .find(|(ck, _)| ck == k)
+            .map(|(_, v)| v.clone())
+    };
+    // A missing uuid means the annex is not initialised; returning empty metadata
+    // would overwrite a good cache entry with zeros.
+    let uuid = cfg("annex.uuid").unwrap_or_default();
     if uuid.is_empty() {
         anyhow::bail!(
             "{}: annex.uuid is empty — not an initialised annex?",
             root.display()
         );
     }
-    let desc = run_git(&root, &["config", "--get", "annex.describe"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let numcopies = run_git(&root, &["config", "--get", "annex.numcopies"])
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .or_else(|| {
-            run_git(&root, &["show", "git-annex:numcopies.log"])
-                .ok()
-                .and_then(|t| parse_count_log(&t))
-        });
+    let desc = cfg("annex.describe").unwrap_or_default();
 
-    // Read logs from git-annex branch
-    let uuid_log = run_git(&root, &["show", "git-annex:uuid.log"]).unwrap_or_default();
-    let remote_log = run_git(&root, &["show", "git-annex:remote.log"]).unwrap_or_default();
-    let trust_log = run_git(&root, &["show", "git-annex:trust.log"]).unwrap_or_default();
-    let activity_log = run_git(&root, &["show", "git-annex:activity.log"]).unwrap_or_default();
-    let group_log = run_git(&root, &["show", "git-annex:group.log"]).unwrap_or_default();
-    let preferred_log =
-        run_git(&root, &["show", "git-annex:preferred-content.log"]).unwrap_or_default();
-    let required_log =
-        run_git(&root, &["show", "git-annex:required-content.log"]).unwrap_or_default();
+    let logs = read_branch_logs(&root)?;
+    let log = |name: &str| logs.named.get(name).map(String::as_str).unwrap_or("");
 
-    let uuid_entries = parse_uuid_log(&uuid_log);
-    let remote_cfgs = parse_remote_log(&remote_log);
-    let trusts = parse_trust_log(&trust_log);
-    let fscks = parse_activity_log(&activity_log);
-    let groups_map = parse_group_log(&group_log);
-    let wanted_map = parse_content_log(&preferred_log);
-    let required_map = parse_content_log(&required_log);
+    // `git annex numcopies` (branch) overrides the legacy annex.numcopies git config.
+    let numcopies = parse_count_log(log("numcopies.log"))
+        .or_else(|| cfg("annex.numcopies").and_then(|s| s.parse().ok()));
+
+    let uuid_entries = parse_uuid_log(log("uuid.log"));
+    let remote_cfgs = parse_remote_log(log("remote.log"));
+    let trusts = parse_trust_log(log("trust.log"));
+    let fscks = parse_activity_log(log("activity.log"));
+    let groups_map = parse_group_log(log("group.log"));
+    let wanted_map = parse_content_log(log("preferred-content.log"));
+    let required_map = parse_content_log(log("required-content.log"));
+
+    let trust_of = |u: &str| trusts.get(u).copied().unwrap_or(TrustLevel::SemiTrusted);
 
     // Build remotes map. Start from uuid.log entries + remotes
     let mut remotes: HashMap<String, Remote> = HashMap::new();
-
     for (u, d) in &uuid_entries {
         let cfg = remote_cfgs.get(u).cloned().unwrap_or_default();
-        let trust = trusts.get(u).copied().unwrap_or(TrustLevel::SemiTrusted);
-        let last_fsck = fscks.get(u).copied();
         let description = match cfg.get("name") {
             Some(name) if d.is_empty() || d == u => name.clone(),
             _ if d.is_empty() => u.clone(),
@@ -1186,52 +1372,49 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         };
         remotes.insert(
             u.clone(),
-            Remote::new(u.clone(), description, cfg, trust, last_fsck),
-        );
-    }
-
-    // Ensure any only-in-remote.log are present
-    for (u, cfg) in &remote_cfgs {
-        if !remotes.contains_key(u) {
-            let trust = trusts.get(u).copied().unwrap_or(TrustLevel::SemiTrusted);
-            let last_fsck = fscks.get(u).copied();
-            let description = cfg.get("name").cloned().unwrap_or_else(|| u.clone());
-            remotes.insert(
-                u.clone(),
-                Remote::new(u.clone(), description, cfg.clone(), trust, last_fsck),
-            );
-        }
-    }
-
-    // Add the local "here" if missing (from config)
-    if !uuid.is_empty() && !remotes.contains_key(&uuid) {
-        let mut cfg = HashMap::new();
-        cfg.insert("name".to_string(), "here".to_string());
-        remotes.insert(
-            uuid.clone(),
             Remote::new(
-                uuid.clone(),
-                if desc.is_empty() {
-                    "here".to_string()
-                } else {
-                    desc.clone()
-                },
+                u.clone(),
+                description,
                 cfg,
-                trusts
-                    .get(&uuid)
-                    .copied()
-                    .unwrap_or(TrustLevel::SemiTrusted),
-                fscks.get(&uuid).copied(),
+                trust_of(u),
+                fscks.get(u).copied(),
             ),
         );
     }
+    // Ensure any only-in-remote.log are present
+    for (u, cfg) in &remote_cfgs {
+        remotes.entry(u.clone()).or_insert_with(|| {
+            let description = cfg.get("name").cloned().unwrap_or_else(|| u.clone());
+            Remote::new(
+                u.clone(),
+                description,
+                cfg.clone(),
+                trust_of(u),
+                fscks.get(u).copied(),
+            )
+        });
+    }
+    // Add the local "here" if missing (from config)
+    remotes.entry(uuid.clone()).or_insert_with(|| {
+        let cfg = HashMap::from([("name".to_string(), "here".to_string())]);
+        let description = if desc.is_empty() {
+            "here".to_string()
+        } else {
+            desc.clone()
+        };
+        Remote::new(
+            uuid.clone(),
+            description,
+            cfg,
+            trust_of(&uuid),
+            fscks.get(&uuid).copied(),
+        )
+    });
 
     // Assign groups / wanted / required to remotes (including here)
     for (u, r) in remotes.iter_mut() {
         if let Some(gs) = groups_map.get(u) {
-            let mut gs = gs.clone();
-            gs.sort();
-            r.groups = gs;
+            r.groups = gs.clone();
         }
         r.wanted = wanted_map.get(u).cloned();
         r.required = required_map.get(u).cloned();
@@ -1242,24 +1425,21 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     if let Some(n) = numcopies {
         additional_configs.push(format!("annex.numcopies={}", n));
     }
-    // Parse top-level .gitattributes for annex.* settings (numcopies per path etc.)
-    let ga_path = root.join(".gitattributes");
-    if ga_path.exists()
-        && let Ok(content) = std::fs::read_to_string(&ga_path)
-    {
+    // Top-level .gitattributes annex.* settings (numcopies per path etc.)
+    if let Ok(content) = std::fs::read_to_string(root.join(".gitattributes")) {
         for line in content.lines() {
             let l = line.trim();
-            if l.contains("annex.numcopies") || l.contains("annex.") {
+            if l.contains("annex.") {
                 additional_configs.push(format!(".gitattributes: {}", l));
             }
         }
     }
-    // Also pull other annex.* config for visibility
-    if let Ok(cfg_list) = run_git(&root, &["config", "--get-regexp", "^annex\\."]) {
-        for line in cfg_list.lines() {
-            if !line.contains("numcopies") && !line.contains("uuid") && !line.contains("describe") {
-                additional_configs.push(line.to_string());
-            }
+    for (k, v) in &config {
+        if !matches!(
+            k.as_str(),
+            "annex.numcopies" | "annex.uuid" | "annex.describe"
+        ) {
+            additional_configs.push(format!("{k} {v}"));
         }
     }
 
@@ -1267,10 +1447,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // so dropped or missing content is still listed.
     let files = load_annexed_files(&root);
 
-    // Presence from git-annex branch location logs (includes untrusted remotes
-    // such as Glacier). `whereis --json --all` is too slow on large annexes and
-    // left used-storage figures stale after `copy --to` Glacier.
-    let mut locations = load_locations_from_branch(&root)?;
+    let mut locations = logs.locations;
     drop_dead_remotes(&uuid, &mut remotes, &mut locations);
 
     let total_keys = locations.len().max(files.len());
@@ -1301,6 +1478,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         total_keys,
         unique_size,
         consumed_size,
+        fingerprint,
     })
 }
 
@@ -1690,7 +1868,7 @@ u2 something else timestamp=9s
         mkdir(&root.join("plain"));
         std::fs::write(root.join("plain/file.txt"), b"hi").unwrap();
 
-        let found = find_annex_repos(&root);
+        let found = find_annex_repos(&root, &DiscoverOptions::default());
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 2, "found {found:?}");
         assert!(
@@ -1698,6 +1876,43 @@ u2 something else timestamp=9s
                 .iter()
                 .all(|p| p.ends_with("photos") || p.ends_with("docs"))
         );
+    }
+
+    #[test]
+    fn read_ref_handles_loose_packed_symbolic_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = dir.path();
+        mkdir(&g.join("refs/heads"));
+        std::fs::write(g.join("refs/heads/main"), "aaaa\n").unwrap();
+        std::fs::write(g.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            g.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted\nbbbb refs/heads/git-annex\n^cccc\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_ref(g, "refs/heads/main", 0),
+            RefLookup::Found("aaaa".into())
+        );
+        assert_eq!(
+            read_ref(g, "refs/heads/git-annex", 0),
+            RefLookup::Found("bbbb".into())
+        );
+        assert_eq!(read_ref(g, "refs/heads/nope", 0), RefLookup::Absent);
+        assert_eq!(read_head(g, g), RefLookup::Found("aaaa".into()));
+        std::fs::write(g.join("HEAD"), "dddd\n").unwrap();
+        assert_eq!(read_head(g, g), RefLookup::Found("dddd".into()));
+    }
+
+    #[test]
+    fn plain_git_repo_is_not_an_annex_without_spawning_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("plain");
+        mkdir(&repo.join(".git/refs/heads"));
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(!is_annex_repo(&repo));
+        std::fs::write(repo.join(".git/packed-refs"), "eeee refs/heads/git-annex\n").unwrap();
+        assert!(is_annex_repo(&repo));
     }
 
     #[test]
@@ -1717,7 +1932,7 @@ u2 something else timestamp=9s
         mkdir(&wt);
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
         let ok = is_annex_repo(&wt);
-        let found = find_annex_repos(&root);
+        let found = find_annex_repos(&root, &DiscoverOptions::default());
         let _ = std::fs::remove_dir_all(&root);
         assert!(ok);
         assert!(found.iter().any(|p| p.ends_with("tree")), "found {found:?}");
@@ -1736,6 +1951,7 @@ u2 something else timestamp=9s
             total_keys: 0,
             unique_size: 0,
             consumed_size: 0,
+            fingerprint: None,
         }
     }
 
@@ -2101,6 +2317,13 @@ here-uuid 1 timestamp=125s
         assert_eq!(by_path["videos/big.mkv"].size, Some(50000));
         assert_eq!(by_path["photos/small.jpg"].size, Some(1000));
         assert_eq!(by_path["videos/clips/mid.bin"].size, Some(8000));
-        assert_eq!(meta.expect("load_metadata").files.len(), 3);
+        let meta = meta.expect("load_metadata");
+        assert_eq!(meta.files.len(), 3);
+        let fp = meta.fingerprint.expect("fingerprint");
+        assert_eq!(fp.annex_branch.len(), 40, "{fp:?}");
+        assert_eq!(fp.head.len(), 40, "{fp:?}");
+        // Two keys still here (small.jpg's content stays even though the symlink is gone).
+        assert_eq!(meta.remotes[&meta.uuid].present_count, 2);
+        assert_eq!(meta.description, "testdemo");
     }
 }
