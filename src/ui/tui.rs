@@ -39,7 +39,8 @@ static HELP_TEXT: &str = r#"
   ← / Back / h   back
   Esc            close zoom / filter, else back (never quits)
   ⇧PgUp/PgDn     scroll details (also J / K, Ctrl+d / Ctrl+u)
-  r / F5         refresh (re-scan)
+  r / F5         refresh (re-scan every repo)
+  s              sort repos: name → size → copy health → files
   /              filter current list
   x              toggle raw view (locations, or TSV of a disk-usage dir)
   z              zoom visual to full screen

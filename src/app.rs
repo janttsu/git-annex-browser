@@ -1,16 +1,17 @@
 /*!
 App state and command dispatch, modeled on zfs-browser.
 
-The heavy data lives on the worker thread.
+`App` lives on the worker thread. Metadata is shared as `Arc` so the cache
+writer and loader threads can use it; the node tree itself is `Rc`.
 */
 
-use crate::annex::{self, AnnexMetadata, RepoSummary, aggregate_remote_usage};
+use crate::annex::{AnnexMetadata, DriveProfile, RepoSummary, aggregate_remote_usage};
 use crate::node::{Node, NodeKind, RepoLoadingNode, RepoNode, RootNode};
 use crate::usage::UsageListing;
-use anyhow::Result;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -24,9 +25,55 @@ pub enum Command {
     Descend,
     Back,
     Refresh,
+    CycleSort,
     ToggleHelp,
     Select(usize),
     None,
+}
+
+/// Order of repos in the root list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Size,
+    Health,
+    Files,
+}
+
+impl SortMode {
+    pub fn next(self) -> Self {
+        match self {
+            SortMode::Name => SortMode::Size,
+            SortMode::Size => SortMode::Health,
+            SortMode::Health => SortMode::Files,
+            SortMode::Files => SortMode::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Name => "name",
+            SortMode::Size => "size",
+            SortMode::Health => "copy health",
+            SortMode::Files => "file count",
+        }
+    }
+
+    fn sort(self, v: &mut [RepoSummary]) {
+        match self {
+            SortMode::Name => v.sort_by(|a, b| a.name.cmp(&b.name).then(a.root.cmp(&b.root))),
+            SortMode::Size => v.sort_by_key(|a| std::cmp::Reverse(a.unique_size)),
+            // Share of keys under numcopies, worst first.
+            SortMode::Health => v.sort_by(|a, b| {
+                let ratio = |s: &RepoSummary| s.keys_under as f64 / s.keys_tracked.max(1) as f64;
+                ratio(b)
+                    .total_cmp(&ratio(a))
+                    .then(b.keys_under.cmp(&a.keys_under))
+            }),
+            SortMode::Files => v.sort_by_key(|a| std::cmp::Reverse(a.file_count)),
+        }
+    }
 }
 
 pub struct Level {
@@ -41,21 +88,26 @@ pub struct App {
     pub root_path: PathBuf,
     /// Last status message for UI.
     pub status: String,
-    /// Preloaded full metadata for fast navigation (populated from cache + bg scan)
-    pub preloaded: HashMap<PathBuf, Rc<AnnexMetadata>>,
-    /// Lightweight summaries for instant root listing (from cache or computed)
+    /// Full metadata for fast navigation (from cache files and background loads).
+    pub preloaded: HashMap<PathBuf, Arc<AnnexMetadata>>,
+    /// Lightweight summaries for the root listing.
     pub summaries: Vec<RepoSummary>,
-    /// Paths we still want to (re)hydrate from disk in the background
-    pub to_hydrate: Vec<PathBuf>,
+    /// Repos in the cache that the last discovery did not find (path -> since).
+    pub missing: HashMap<PathBuf, i64>,
     /// Profiles of drives by their name (e.g. "remote-foo") across all repos, for anomaly detection.
-    pub drive_profiles: Rc<HashMap<String, annex::DriveProfile>>,
+    pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
     /// Background scan still running (hydrate queue or in-flight loads).
     pub scanning: bool,
+    pub sort: SortMode,
 }
 
 impl App {
     pub fn new(scan_root: PathBuf) -> Self {
-        let root = Rc::new(RootNode::new(scan_root.clone(), Rc::from(Vec::new())));
+        let root = Rc::new(RootNode::new(
+            scan_root.clone(),
+            Rc::from(Vec::new()),
+            Rc::new(HashMap::new()),
+        ));
         Self {
             stack: vec![Level {
                 node: root,
@@ -65,62 +117,54 @@ impl App {
             status: "scanning for git annex repos...".into(),
             preloaded: HashMap::new(),
             summaries: vec![],
-            to_hydrate: vec![],
+            missing: HashMap::new(),
             drive_profiles: Rc::new(HashMap::new()),
             scanning: false,
+            sort: SortMode::default(),
         }
     }
 
     fn current_level_mut(&mut self) -> &mut Level {
-        self.stack.last_mut().unwrap()
+        self.stack.last_mut().expect("stack has root")
     }
 
-    /// Build a fresh snapshot-friendly view from current selection path.
+    /// Build a snapshot of the current view for the UI thread.
     pub fn snapshot(&self) -> ViewSnapshot {
-        let level = self.stack.last().unwrap();
+        let level = self.stack.last().expect("stack has root");
         let kids = level.node.children();
         let sel = level.selected.min(kids.len().saturating_sub(1));
         let selected_node = kids.get(sel).cloned();
 
+        let names: HashMap<&Path, &str> = self
+            .summaries
+            .iter()
+            .map(|s| (s.root.as_path(), s.name.as_str()))
+            .collect();
         let list_items: Vec<ListItem> = kids
             .iter()
-            .map(|n| {
-                let repo_name = n.annex_repo_path().or(n.loaded_repo_path()).and_then(|p| {
-                    self.summaries
-                        .iter()
-                        .find(|s| s.root == p)
-                        .map(|s| s.name.clone())
-                });
-                ListItem {
-                    label: n.label(),
-                    kind: n.kind(),
-                    anomalous: n.anomalous(),
-                    trust: n.trust(),
-                    repo_name,
-                    size: n.size(),
-                    missing: n.present() == Some(false),
-                    under_copies: n.under_copies(),
-                }
+            .map(|n| ListItem {
+                label: n.label(),
+                kind: n.kind(),
+                anomalous: n.anomalous(),
+                trust: n.trust(),
+                repo_name: n
+                    .annex_repo_path()
+                    .or(n.loaded_repo_path())
+                    .and_then(|p| names.get(p))
+                    .map(|s| s.to_string()),
+                size: n.size(),
+                missing: n.present() == Some(false),
+                under_copies: n.under_copies(),
             })
             .collect();
 
-        let details = if let Some(n) = &selected_node {
-            n.details()
-        } else {
-            vec!["no selection".into()]
+        let details = match &selected_node {
+            Some(n) => n.details(),
+            None => vec!["no selection".into()],
         };
-
         let raw = selected_node.as_ref().and_then(|n| n.raw_text());
-
-        let crumb: Vec<String> = self.stack.iter().map(|l| l.node.label()).collect();
-
-        let visual = Some(VisualReport::from_summaries(&self.summaries));
-        let repo_visuals: Vec<VisualRepoDetail> = self
-            .summaries
-            .iter()
-            .map(VisualRepoDetail::from_summary)
-            .collect();
         let usage = selected_node.as_ref().and_then(|n| n.usage_listing());
+        let crumb: Vec<String> = self.stack.iter().map(|l| l.node.label()).collect();
 
         ViewSnapshot {
             crumb,
@@ -128,8 +172,12 @@ impl App {
             selected: sel,
             details,
             raw,
-            visual,
-            repo_visuals,
+            visual: Some(VisualReport::from_summaries(&self.summaries)),
+            repo_visuals: self
+                .summaries
+                .iter()
+                .map(VisualRepoDetail::from_summary)
+                .collect(),
             usage,
             status: self.status.clone(),
             total_repos: self.summaries.len(),
@@ -137,9 +185,12 @@ impl App {
         }
     }
 
-    pub fn execute(&mut self, cmd: Command, page: usize) -> Result<()> {
+    /// Apply a navigation command. Returns the repo path to load when the user
+    /// descended into a repo whose metadata is not available yet.
+    pub fn execute(&mut self, cmd: Command, page: usize) -> Option<PathBuf> {
+        let page = page.max(1);
         match cmd {
-            Command::None | Command::Quit | Command::ToggleHelp => {}
+            Command::None | Command::Quit | Command::ToggleHelp | Command::Refresh => {}
             Command::Select(i) => {
                 let l = self.current_level_mut();
                 let max = l.node.children().len().saturating_sub(1);
@@ -147,31 +198,23 @@ impl App {
             }
             Command::Up => {
                 let l = self.current_level_mut();
-                if l.selected > 0 {
-                    l.selected -= 1;
-                }
+                l.selected = l.selected.saturating_sub(1);
             }
             Command::Down => {
                 let l = self.current_level_mut();
                 let max = l.node.children().len().saturating_sub(1);
-                if l.selected < max {
-                    l.selected += 1;
-                }
+                l.selected = (l.selected + 1).min(max);
             }
             Command::PageUp => {
                 let l = self.current_level_mut();
-                let page = page.max(1);
                 l.selected = l.selected.saturating_sub(page);
             }
             Command::PageDown => {
                 let l = self.current_level_mut();
-                let kids_len = l.node.children().len();
-                let page = page.max(1);
-                l.selected = (l.selected + page).min(kids_len.saturating_sub(1));
+                let max = l.node.children().len().saturating_sub(1);
+                l.selected = (l.selected + page).min(max);
             }
-            Command::Top => {
-                self.current_level_mut().selected = 0;
-            }
+            Command::Top => self.current_level_mut().selected = 0,
             Command::Bottom => {
                 let l = self.current_level_mut();
                 l.selected = l.node.children().len().saturating_sub(1);
@@ -181,99 +224,95 @@ impl App {
                     self.stack.pop();
                 }
             }
-            Command::Descend => {
-                let l = self.stack.last().unwrap();
-                let kids = l.node.children();
-                if let Some(child) = kids.get(l.selected)
-                    && !child.kind().is_visual()
-                {
-                    if child.kind() == NodeKind::Parent {
-                        if self.stack.len() > 1 {
-                            self.stack.pop();
-                        }
-                    } else if let Some(p) = child.annex_repo_path() {
-                        if let Some(meta) = self.preloaded.get(p).cloned() {
-                            // Instant because of bg pre-scan or cache
-                            let profiles = Rc::clone(&self.drive_profiles);
-                            let node = Rc::new(RepoNode::new(meta, profiles));
-                            self.stack.push(Level { node, selected: 0 });
-                            self.status = "preloaded".into();
-                        } else {
-                            self.status = format!("loading {} ...", p.display());
-                            let loading = Rc::new(RepoLoadingNode {
-                                path: p.to_path_buf(),
-                            });
-                            self.stack.push(Level {
-                                node: loading,
-                                selected: 0,
-                            });
-                        }
-                    } else {
-                        let selected = child.initial_selected();
-                        self.stack.push(Level {
-                            node: Rc::clone(child),
-                            selected,
-                        });
-                    }
-                }
+            Command::CycleSort => {
+                self.sort = self.sort.next();
+                self.status = format!("repos sorted by {}", self.sort.label());
+                self.refresh_root_view();
             }
-            Command::Refresh => {
-                // Rebuild from root, replay selection if possible.
-                self.refresh();
-            }
+            Command::Descend => return self.descend(),
         }
-        Ok(())
+        None
     }
 
-    /// Full refresh: re-discover and reload current path if possible.
-    fn refresh(&mut self) {
-        self.status = "refreshing...".into();
-        // Simplest: pop to root and let user re-descend. Full path replay is more work.
-        // For v1 we reset to a fresh root scan (worker will re-discover).
-        while self.stack.len() > 1 {
-            self.stack.pop();
+    fn descend(&mut self) -> Option<PathBuf> {
+        let l = self.stack.last().expect("stack has root");
+        let kids = l.node.children();
+        let child = kids.get(l.selected)?;
+        if child.kind().is_visual() {
+            return None;
         }
-        if let Some(root_level) = self.stack.first_mut() {
-            // The actual new root node is created in worker on Refresh
-            root_level.selected = 0;
+        if child.kind() == NodeKind::Parent {
+            if self.stack.len() > 1 {
+                self.stack.pop();
+            }
+            return None;
         }
+        let Some(p) = child.annex_repo_path() else {
+            let selected = child.initial_selected();
+            let node = Rc::clone(child);
+            self.stack.push(Level { node, selected });
+            return None;
+        };
+        let p = p.to_path_buf();
+        if let Some(meta) = self.preloaded.get(&p).cloned() {
+            let node = Rc::new(RepoNode::new(meta, Rc::clone(&self.drive_profiles)));
+            self.stack.push(Level { node, selected: 0 });
+            return None;
+        }
+        self.status = format!("loading {} ...", p.display());
+        self.stack.push(Level {
+            node: Rc::new(RepoLoadingNode { path: p.clone() }),
+            selected: 0,
+        });
+        Some(p)
     }
 
-    /// Called from worker after a successful full repo load.
-    /// Replaces the top loading node with the real RepoNode.
-    pub fn install_loaded_repo(&mut self, meta: AnnexMetadata) {
-        if self
-            .stack
+    /// Back to the root list (used by refresh).
+    pub fn pop_to_root(&mut self) {
+        self.stack.truncate(1);
+        self.stack[0].selected = 0;
+    }
+
+    /// The loading placeholder on top of the stack, if any.
+    pub fn awaiting_load(&self) -> Option<PathBuf> {
+        self.stack
             .last()
-            .is_some_and(|l| l.node.loading_path().is_some())
-        {
+            .and_then(|l| l.node.loading_path())
+            .map(Path::to_path_buf)
+    }
+
+    /// Drop a loading placeholder that cannot be satisfied.
+    pub fn cancel_loading(&mut self, root: &Path, why: String) {
+        if self.awaiting_load().as_deref() == Some(root) {
             self.stack.pop();
         }
-        let root = meta.root.clone();
-        self.ingest_meta(meta);
-        let meta = Rc::clone(self.preloaded.get(&root).expect("metadata just ingested"));
-        let profiles = Rc::clone(&self.drive_profiles);
-        let node = Rc::new(RepoNode::new(meta, profiles));
-        self.stack.push(Level { node, selected: 0 });
-        self.status = "loaded".into();
+        self.status = why;
+    }
+
+    /// Replace the root list with cached index rows.
+    pub fn set_cached(&mut self, summaries: Vec<RepoSummary>, missing: HashMap<PathBuf, i64>) {
+        self.summaries = summaries;
+        for s in &mut self.summaries {
+            s.ensure_name();
+        }
+        self.missing = missing;
         self.refresh_root_view();
     }
 
-    /// Update the root list and status. Also rebuilds the root node from current summaries.
-    pub fn set_discovered(&mut self, repos: Vec<PathBuf>) {
-        // If we have cached summaries, use them; otherwise create minimal ones from paths
-        if self.summaries.is_empty() {
-            self.summaries = repos
-                .iter()
-                .map(|p| RepoSummary::placeholder(p.clone()))
-                .collect();
+    /// Record discovery: add placeholders for new repos and mark cached ones not found.
+    pub fn set_discovered(&mut self, found: &[PathBuf], now: i64) {
+        for p in found {
+            self.missing.remove(p);
+            if !self.summaries.iter().any(|s| &s.root == p) {
+                self.summaries.push(RepoSummary::placeholder(p.clone()));
+            }
+        }
+        for s in &self.summaries {
+            if !found.contains(&s.root) {
+                self.missing.entry(s.root.clone()).or_insert(now);
+            }
         }
         self.refresh_root_view();
-        self.status = format!(
-            "found {} annex repos ({} cached)",
-            repos.len(),
-            self.preloaded.len()
-        );
     }
 
     pub fn apply_summary(&mut self, mut s: RepoSummary) {
@@ -286,26 +325,35 @@ impl App {
         self.refresh_root_view();
     }
 
-    /// Merge a freshly loaded full meta into preloaded + summaries.
-    pub fn ingest_meta(&mut self, mut meta: AnnexMetadata) {
+    /// Merge freshly loaded metadata into the model and refresh open views.
+    pub fn ingest_meta(&mut self, mut meta: AnnexMetadata) -> Arc<AnnexMetadata> {
         meta.ensure_sizes();
         let sum = meta.to_summary();
         let root = meta.root.clone();
-        self.preloaded.insert(root.clone(), Rc::new(meta));
+        let meta = Arc::new(meta);
+        self.preloaded.insert(root.clone(), Arc::clone(&meta));
         self.apply_summary(sum);
         self.recompute_drive_profiles();
         self.replace_open_repo(&root);
+        if self.awaiting_load().as_deref() == Some(root.as_path()) {
+            self.stack.pop();
+            let node = Rc::new(RepoNode::new(
+                Arc::clone(&meta),
+                Rc::clone(&self.drive_profiles),
+            ));
+            self.stack.push(Level { node, selected: 0 });
+            self.status = "loaded".into();
+        }
+        meta
     }
 
     /// Recompute drive name -> profile map from all preloaded metas.
     /// Used to highlight drives that differ (trust, groups, wanted, required) from the common setup.
     pub fn recompute_drive_profiles(&mut self) {
-        use crate::annex::DriveProfile;
         let mut profiles: HashMap<String, DriveProfile> = HashMap::new();
         for meta in self.preloaded.values() {
             for r in meta.remotes.values() {
-                let name = r.name().to_string();
-                let p = profiles.entry(name).or_default();
+                let p = profiles.entry(r.name().to_string()).or_default();
                 *p.trusts.entry(r.trust).or_default() += 1;
                 let mut gs = r.groups.clone();
                 gs.sort();
@@ -317,32 +365,42 @@ impl App {
         self.drive_profiles = Rc::new(profiles);
     }
 
-    /// Rebuild/replace the root level node using the current summaries (no downcast).
+    /// Rebuild the root level from the current summaries, keeping the selected repo.
     pub fn refresh_root_view(&mut self) {
-        let prev = self.stack.first().map(|l| l.selected).unwrap_or(0);
-        let new_root = RootNode::new(self.root_path.clone(), Rc::from(self.summaries.clone()));
-        if let Some(lvl) = self.stack.first_mut() {
-            lvl.node = Rc::new(new_root);
-            let max = lvl.node.children().len().saturating_sub(1);
-            lvl.selected = prev.min(max);
-        }
+        let prev_path = {
+            let lvl = &self.stack[0];
+            lvl.node
+                .children()
+                .get(lvl.selected)
+                .and_then(|n| n.annex_repo_path().map(Path::to_path_buf))
+        };
+        let prev_idx = self.stack[0].selected;
+        let mut sorted = self.summaries.clone();
+        self.sort.sort(&mut sorted);
+        let node = Rc::new(RootNode::new(
+            self.root_path.clone(),
+            Rc::from(sorted),
+            Rc::new(self.missing.clone()),
+        ));
+        let kids = node.children();
+        let selected = prev_path
+            .and_then(|p| kids.iter().position(|k| k.annex_repo_path() == Some(&p)))
+            .unwrap_or(prev_idx)
+            .min(kids.len().saturating_sub(1));
+        self.stack[0] = Level { node, selected };
         if self.stack.len() >= 2 && self.stack[1].node.kind() == NodeKind::Report {
-            let kids = self.stack[0].node.children();
-            if let Some(report) = kids.iter().find(|n| n.kind() == NodeKind::Report) {
-                let sel = self.stack[1].selected;
-                self.stack[1].node = Rc::clone(report);
-                self.stack[1].selected = sel;
+            let report = kids.iter().find(|n| n.kind() == NodeKind::Report).cloned();
+            if let Some(report) = report {
+                self.stack[1].node = report;
             }
         }
     }
 
     /// If the user is inside a repo that was just re-scanned, rebuild that subtree.
-    pub fn replace_open_repo(&mut self, root: &std::path::Path) {
-        let Some(pos) = self
-            .stack
-            .iter()
-            .position(|l| l.node.loaded_repo_path() == Some(root))
-        else {
+    pub fn replace_open_repo(&mut self, root: &Path) {
+        let Some(pos) = self.stack.iter().position(|l| {
+            l.node.loaded_repo_path() == Some(root) && l.node.kind() == NodeKind::Repo
+        }) else {
             return;
         };
         let selections: Vec<usize> = self.stack[pos..].iter().map(|l| l.selected).collect();
@@ -351,20 +409,18 @@ impl App {
             return;
         };
         let node = Rc::new(RepoNode::new(meta, Rc::clone(&self.drive_profiles)));
-        let first_sel = selections.first().copied().unwrap_or(0);
         self.stack.push(Level {
             node,
-            selected: first_sel,
+            selected: selections[0],
         });
-        for i in 0..selections.len().saturating_sub(1) {
-            let kids = self.stack.last().unwrap().node.children();
+        for &child_sel in &selections[1..] {
+            let top = self.stack.last_mut().expect("just pushed");
+            let kids = top.node.children();
             if kids.is_empty() {
                 break;
             }
-            let sel = self.stack.last().unwrap().selected.min(kids.len() - 1);
-            self.stack.last_mut().unwrap().selected = sel;
-            let child = Rc::clone(&kids[sel]);
-            let child_sel = selections.get(i + 1).copied().unwrap_or(0);
+            top.selected = top.selected.min(kids.len() - 1);
+            let child = Rc::clone(&kids[top.selected]);
             let child_sel = child_sel.min(child.children().len().saturating_sub(1));
             self.stack.push(Level {
                 node: child,
@@ -401,7 +457,7 @@ pub struct ListItem {
     pub repo_name: Option<String>,
     /// git-annex size for ncdu-style rows (not filesystem size).
     pub size: Option<u64>,
-    /// True when annexed content is not present on this repo.
+    /// True when annexed content is not present on this repo, or the repo is not mounted.
     pub missing: bool,
     /// Some keys have fewer counting copies than numcopies.
     pub under_copies: bool,
@@ -559,5 +615,89 @@ impl VisualRepoDetail {
             keys_over: s.keys_over,
             remotes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::sample_meta;
+
+    fn app_with_sample() -> App {
+        let mut app = App::new(PathBuf::from("/data"));
+        app.set_discovered(&[PathBuf::from("/data/photos")], 1);
+        app
+    }
+
+    fn select_label(app: &mut App, needle: &str) {
+        let kids = app.stack.last().unwrap().node.children();
+        let idx = kids
+            .iter()
+            .position(|k| k.label().contains(needle))
+            .unwrap_or_else(|| panic!("no child containing {needle:?}"));
+        app.execute(Command::Select(idx), 10);
+    }
+
+    #[test]
+    fn descending_before_load_shows_placeholder_then_repo() {
+        let mut app = app_with_sample();
+        select_label(&mut app, "photos");
+        let want = app.execute(Command::Descend, 10);
+        assert_eq!(want, Some(PathBuf::from("/data/photos")));
+        assert_eq!(app.awaiting_load(), Some(PathBuf::from("/data/photos")));
+        app.ingest_meta(sample_meta());
+        assert_eq!(app.awaiting_load(), None);
+        assert_eq!(app.stack.len(), 2);
+        assert_eq!(app.stack[1].node.kind(), NodeKind::Repo);
+    }
+
+    #[test]
+    fn rescan_keeps_the_user_inside_the_repo_tree() {
+        let mut app = app_with_sample();
+        app.ingest_meta(sample_meta());
+        select_label(&mut app, "photos");
+        assert_eq!(app.execute(Command::Descend, 10), None);
+        select_label(&mut app, "all annexed files");
+        app.execute(Command::Descend, 10);
+        select_label(&mut app, "2024/");
+        app.execute(Command::Descend, 10);
+        let crumb_before: Vec<String> = app.stack.iter().map(|l| l.node.label()).collect();
+        app.ingest_meta(sample_meta());
+        let crumb_after: Vec<String> = app.stack.iter().map(|l| l.node.label()).collect();
+        assert_eq!(crumb_before, crumb_after);
+    }
+
+    #[test]
+    fn undiscovered_cached_repo_is_marked_missing() {
+        let mut app = App::new(PathBuf::from("/data"));
+        let mut s = RepoSummary::placeholder(PathBuf::from("/data/offline"));
+        s.file_count = 3;
+        app.set_cached(vec![s], HashMap::new());
+        app.set_discovered(&[], 42);
+        assert_eq!(app.missing.get(Path::new("/data/offline")), Some(&42));
+        let snap = app.snapshot();
+        let row = snap
+            .list
+            .iter()
+            .find(|r| r.label.contains("offline"))
+            .unwrap();
+        assert!(row.missing);
+        assert!(row.label.contains("not found"), "{}", row.label);
+    }
+
+    #[test]
+    fn cycle_sort_keeps_selected_repo() {
+        let mut app = App::new(PathBuf::from("/data"));
+        let mut a = RepoSummary::placeholder(PathBuf::from("/data/a"));
+        a.unique_size = 1;
+        let mut b = RepoSummary::placeholder(PathBuf::from("/data/b"));
+        b.unique_size = 100;
+        app.set_cached(vec![a, b], HashMap::new());
+        select_label(&mut app, "a —");
+        app.execute(Command::CycleSort, 10);
+        assert_eq!(app.sort, SortMode::Size);
+        let kids = app.stack[0].node.children();
+        assert!(kids[1].label().starts_with("b"));
+        assert!(kids[app.stack[0].selected].label().starts_with("a"));
     }
 }

@@ -1499,16 +1499,6 @@ pub fn short_name(meta: &AnnexMetadata, uuid: &str) -> String {
         .unwrap_or_else(|| uuid.chars().take(8).collect())
 }
 
-// ---------------------- Cache (local DB file) ----------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct AnnexCache {
-    pub version: u32,
-    pub updated: i64,
-    /// canonical path string -> full metadata snapshot
-    pub repos: HashMap<String, AnnexMetadata>,
-}
-
 /// Profile of a drive/remote name across all known repos, used to detect differences.
 #[derive(Debug, Clone, Default)]
 pub struct DriveProfile {
@@ -1576,8 +1566,6 @@ impl DriveProfile {
     }
 }
 
-pub const CACHE_VERSION: u32 = 1;
-
 pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1589,126 +1577,6 @@ pub fn path_is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
-pub fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return PathBuf::from(xdg).join("git-annex-browser");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".cache").join("git-annex-browser")
-}
-
-pub fn cache_path() -> PathBuf {
-    if let Ok(p) = std::env::var("GIT_ANNEX_BROWSER_CACHE")
-        && !p.is_empty()
-    {
-        return PathBuf::from(p);
-    }
-    cache_dir().join("cache.json")
-}
-
-struct CacheLock {
-    _file: std::fs::File,
-}
-
-fn lock_cache() -> Result<CacheLock> {
-    let dir = cache_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(cache_dir);
-    std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join("cache.lock"))?;
-    file.lock().context("locking cache")?;
-    Ok(CacheLock { _file: file })
-}
-
-fn redact_meta(mut meta: AnnexMetadata) -> AnnexMetadata {
-    for r in meta.remotes.values_mut() {
-        for (k, v) in r.config.iter_mut() {
-            if is_secret_remote_key(k) {
-                *v = "[redacted]".to_string();
-            }
-        }
-    }
-    meta
-}
-
-/// Merge a scan of `scan_root` into an existing repo map.
-/// Repos under `scan_root` that were not found this time are dropped; others stay.
-pub fn merge_scan_repos(
-    mut existing: HashMap<String, AnnexMetadata>,
-    scan_root: &Path,
-    found: HashMap<String, AnnexMetadata>,
-) -> HashMap<String, AnnexMetadata> {
-    existing.retain(|p, _| {
-        let pb = Path::new(p);
-        !path_is_under(pb, scan_root) || found.contains_key(p)
-    });
-    for (k, v) in found {
-        existing.insert(k, redact_meta(v));
-    }
-    existing
-}
-
-pub fn load_cache() -> Option<AnnexCache> {
-    let data = std::fs::read(cache_path()).ok()?;
-    let cache: AnnexCache = serde_json::from_slice(&data).ok()?;
-    if cache.version != 0 && cache.version != CACHE_VERSION {
-        return None;
-    }
-    Some(cache)
-}
-
-fn write_cache_unlocked(cache: &AnnexCache) -> Result<()> {
-    let p = cache_path();
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = p.with_extension("json.tmp");
-    let json = serde_json::to_vec(cache)?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, &p)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
-}
-
-/// Replace cached entries under `scan_root` with `found`; keep everything else.
-pub fn merge_scan_into_cache(
-    scan_root: &Path,
-    found: HashMap<String, AnnexMetadata>,
-) -> Result<()> {
-    let _lock = lock_cache()?;
-    let existing = load_cache().unwrap_or_default().repos;
-    let repos = merge_scan_repos(existing, scan_root, found);
-    let cache = AnnexCache {
-        version: CACHE_VERSION,
-        updated: now_unix(),
-        repos,
-    };
-    write_cache_unlocked(&cache)
-}
-
-/// Insert or update the given repos without dropping others.
-pub fn upsert_cache_repos(repos: impl IntoIterator<Item = (String, AnnexMetadata)>) -> Result<()> {
-    let _lock = lock_cache()?;
-    let mut cache = load_cache().unwrap_or_default();
-    cache.version = CACHE_VERSION;
-    cache.updated = now_unix();
-    for (k, v) in repos {
-        cache.repos.insert(k, redact_meta(v));
-    }
-    write_cache_unlocked(&cache)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,14 +1720,8 @@ u2 something else timestamp=9s
 
     #[test]
     fn find_annex_repos_skips_object_store_and_finds_siblings() {
-        let root = std::env::temp_dir().join(format!(
-            "gab-find-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
         mkdir(&root);
         let photos = root.join("photos");
         let docs = root.join("docs");
@@ -1869,7 +1731,6 @@ u2 something else timestamp=9s
         std::fs::write(root.join("plain/file.txt"), b"hi").unwrap();
 
         let found = find_annex_repos(&root, &DiscoverOptions::default());
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(found.len(), 2, "found {found:?}");
         assert!(
             found
@@ -1917,14 +1778,8 @@ u2 something else timestamp=9s
 
     #[test]
     fn is_annex_repo_follows_worktree_gitdir_file() {
-        let root = std::env::temp_dir().join(format!(
-            "gab-wt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
         mkdir(&root);
         let git = root.join("real.git");
         mkdir(&git.join("annex"));
@@ -1933,42 +1788,8 @@ u2 something else timestamp=9s
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
         let ok = is_annex_repo(&wt);
         let found = find_annex_repos(&root, &DiscoverOptions::default());
-        let _ = std::fs::remove_dir_all(&root);
         assert!(ok);
         assert!(found.iter().any(|p| p.ends_with("tree")), "found {found:?}");
-    }
-
-    fn dummy_meta(root: &str) -> AnnexMetadata {
-        AnnexMetadata {
-            root: PathBuf::from(root),
-            uuid: "u".into(),
-            description: String::new(),
-            numcopies: None,
-            additional_configs: vec![],
-            remotes: HashMap::new(),
-            locations: HashMap::new(),
-            files: vec![],
-            total_keys: 0,
-            unique_size: 0,
-            consumed_size: 0,
-            fingerprint: None,
-        }
-    }
-
-    #[test]
-    fn merge_scan_keeps_repos_outside_root() {
-        let mut existing = HashMap::new();
-        existing.insert("/data/media/a".into(), dummy_meta("/data/media/a"));
-        existing.insert("/data/backup/b".into(), dummy_meta("/data/backup/b"));
-        existing.insert("/data/media/gone".into(), dummy_meta("/data/media/gone"));
-        let mut found = HashMap::new();
-        found.insert("/data/media/a".into(), dummy_meta("/data/media/a"));
-        found.insert("/data/media/c".into(), dummy_meta("/data/media/c"));
-        let merged = merge_scan_repos(existing, Path::new("/data/media"), found);
-        assert!(merged.contains_key("/data/media/a"));
-        assert!(merged.contains_key("/data/media/c"));
-        assert!(merged.contains_key("/data/backup/b"));
-        assert!(!merged.contains_key("/data/media/gone"));
     }
 
     #[test]
@@ -2102,7 +1923,7 @@ u2 something else timestamp=9s
             HashSet::from(["old-laptop".into()]),
         );
         locations.insert("SHA256E-s10--cc".into(), HashSet::from(["disk".into()]));
-        let mut meta = dummy_meta("/tmp/a");
+        let mut meta = crate::testutil::meta("/tmp/a");
         meta.uuid = "here".into();
         meta.remotes = remotes;
         meta.locations = locations;
@@ -2133,7 +1954,7 @@ u2 something else timestamp=9s
             "SHA256E-s8--x".into(),
             HashSet::from(["here".into(), "gone".into()]),
         );
-        let mut meta = dummy_meta("/tmp/a");
+        let mut meta = crate::testutil::meta("/tmp/a");
         meta.uuid = "here".into();
         meta.remotes = remotes;
         meta.locations = locations;
@@ -2164,7 +1985,7 @@ u2 something else timestamp=9s
             "SHA256E-s20--k".into(),
             HashSet::from(["here".into(), "dead-box".into()]),
         );
-        let mut meta = dummy_meta("/tmp/a");
+        let mut meta = crate::testutil::meta("/tmp/a");
         meta.uuid = "here".into();
         meta.remotes = remotes;
         meta.locations = locations;
@@ -2220,17 +2041,6 @@ here-uuid 1 timestamp=125s
     }
 
     #[test]
-    fn test_find_and_load_demo() {
-        let p = Path::new("/tmp/annex-demo");
-        if !is_annex_repo(p) {
-            return;
-        }
-        let meta = load_metadata(p).expect("load demo");
-        assert!(!meta.uuid.is_empty());
-        assert!(!meta.remotes.is_empty());
-    }
-
-    #[test]
     fn parse_find_nul_triplets_uses_bytesize_and_key_fallback() {
         let mut buf = Vec::new();
         buf.extend(b"videos/big.mkv\0SHA256E-s50000--abcd.mkv\0");
@@ -2248,65 +2058,17 @@ here-uuid 1 timestamp=125s
         assert_eq!(files[2].size, None);
     }
 
-    fn annex_available() -> bool {
-        Command::new("git")
-            .arg("annex")
-            .arg("version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    fn chmod_u_write(path: &Path) {
-        let _ = Command::new("chmod").args(["-R", "u+w"]).arg(path).status();
-    }
-
     #[test]
     fn load_annexed_files_includes_dropped_and_missing_with_annex_size() {
-        if !annex_available() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(root) = crate::testutil::real_annex(tmp.path(), "testdemo") else {
             return;
-        }
-        let root = std::env::temp_dir().join(format!(
-            "gab-ncdu-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        mkdir(&root);
-        let init = || {
-            let git = |args: &[&str]| {
-                Command::new("git")
-                    .arg("-C")
-                    .arg(&root)
-                    .args(args)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .unwrap()
-            };
-            assert!(git(&["init", "-q"]).success());
-            assert!(git(&["config", "user.email", "t@t"]).success());
-            assert!(git(&["config", "user.name", "t"]).success());
-            assert!(git(&["annex", "init", "-q", "testdemo"]).success());
-            mkdir(&root.join("videos/clips"));
-            mkdir(&root.join("photos"));
-            std::fs::write(root.join("photos/small.jpg"), vec![b'x'; 1000]).unwrap();
-            std::fs::write(root.join("videos/big.mkv"), vec![b'y'; 50000]).unwrap();
-            std::fs::write(root.join("videos/clips/mid.bin"), vec![b'z'; 8000]).unwrap();
-            assert!(git(&["annex", "add", "-q", "photos", "videos"]).success());
-            assert!(git(&["commit", "-q", "-m", "add"]).success());
-            assert!(git(&["annex", "drop", "--force", "-q", "videos/big.mkv"]).success());
-            let _ = std::fs::remove_file(root.join("photos/small.jpg"));
         };
-        init();
+        crate::testutil::git(&root, &["annex", "drop", "--force", "-q", "videos/big.mkv"]);
+        std::fs::remove_file(root.join("photos/small.jpg")).unwrap();
         let files = load_annexed_files(&root);
         let meta = load_metadata(&root);
-        chmod_u_write(&root);
-        let _ = std::fs::remove_dir_all(&root);
+        crate::testutil::make_writable(&root);
         let by_path: HashMap<_, _> = files.iter().map(|f| (f.path.as_str(), f)).collect();
         assert_eq!(
             by_path.len(),
