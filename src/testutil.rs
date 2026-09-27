@@ -30,7 +30,7 @@ pub fn remote(uuid: &str, name: &str, trust: TrustLevel) -> Remote {
 pub fn file(path: &str, size: u64) -> AnnexedFile {
     AnnexedFile {
         path: path.into(),
-        key: format!("SHA256E-s{size}--{}", path.replace('/', "_")),
+        key: format!("SHA256E-s{size}--{}", path.replace('/', "_")).into(),
         size: Some(size),
     }
 }

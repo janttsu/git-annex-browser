@@ -14,6 +14,7 @@
 
 use crate::annex::{
     AnnexMetadata, RepoFingerprint, RepoSummary, is_secret_remote_key, now_unix, path_is_under,
+    with_interning,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -269,7 +270,7 @@ impl Cache {
 
     fn import_legacy(&self) -> Result<()> {
         let f = File::open(&self.legacy)?;
-        let legacy: LegacyCache = serde_json::from_reader(BufReader::new(f))
+        let legacy: LegacyCache = with_interning(|| serde_json::from_reader(BufReader::new(f)))
             .with_context(|| format!("parsing {}", self.legacy.display()))?;
         let _lock = self.lock()?;
         if self.read_index().is_some() {
@@ -307,7 +308,8 @@ impl Cache {
     /// Full metadata for an index entry.
     pub fn load_repo(&self, entry: &IndexEntry) -> Option<AnnexMetadata> {
         let f = File::open(self.repo_path(&entry.file)).ok()?;
-        let mut meta: AnnexMetadata = serde_json::from_reader(BufReader::new(f)).ok()?;
+        let mut meta: AnnexMetadata =
+            with_interning(|| serde_json::from_reader(BufReader::new(f))).ok()?;
         meta.ensure_sizes();
         Some(meta)
     }

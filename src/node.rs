@@ -832,7 +832,7 @@ impl FileTreeNode {
             if !self.on_scope(&f.key) {
                 continue;
             }
-            seen_keys.insert(f.key.as_str());
+            seen_keys.insert(&f.key);
             let Some(rest) = f.path.strip_prefix(&prefix) else {
                 continue;
             };
@@ -871,7 +871,7 @@ impl FileTreeNode {
             && let Some(drive) = self.scope.drive_uuid()
         {
             for (key, locs) in &self.meta.locations {
-                if locs.contains(drive) && !seen_keys.contains(key.as_str()) {
+                if locs.contains(drive) && !seen_keys.contains(&**key) {
                     files.push(Rc::new(AnnexFileNode {
                         meta: Arc::clone(&self.meta),
                         file: AnnexedFile {
@@ -902,7 +902,7 @@ impl Node for FileTreeNode {
                     .meta
                     .locations
                     .values()
-                    .filter(|s| s.contains(uuid))
+                    .filter(|s| s.contains(uuid.as_str()))
                     .count();
                 format!("files on {name} ({cnt})")
             }
@@ -948,10 +948,15 @@ pub fn file_details(
     if let Some(s) = file.size {
         d.push(format!("size: {}", human_bytes(s)));
     }
-    let mut locs: Vec<&String> = meta
+    let mut locs: Vec<&str> = meta
         .locations
         .get(&file.key)
-        .map(|l| l.iter().filter(|u| meta.remotes.contains_key(*u)).collect())
+        .map(|l| {
+            l.iter()
+                .map(|u| &**u)
+                .filter(|u| meta.remotes.contains_key(*u))
+                .collect()
+        })
         .unwrap_or_default();
     if locs.is_empty() {
         d.push("no location records (perhaps never copied)".into());
@@ -966,11 +971,7 @@ pub fn file_details(
             .get(u)
             .map(|r| r.trust)
             .unwrap_or(TrustLevel::SemiTrusted);
-        let star = if Some(u.as_str()) == highlight {
-            " ★"
-        } else {
-            ""
-        };
+        let star = if Some(u) == highlight { " ★" } else { "" };
         d.push(format!("  {} {}{}", name, trust.short(), star));
     }
     d
@@ -979,7 +980,7 @@ pub fn file_details(
 /// Raw location record for the `x` view.
 pub fn file_raw(meta: &AnnexMetadata, file: &AnnexedFile) -> Option<String> {
     let locs = meta.locations.get(&file.key)?;
-    let mut uuids: Vec<&String> = locs.iter().collect();
+    let mut uuids: Vec<&str> = locs.iter().map(|u| &**u).collect();
     uuids.sort();
     let mut s = format!("key: {}\n", file.key);
     for u in uuids {

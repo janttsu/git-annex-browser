@@ -7,6 +7,97 @@ use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+
+/// Shared string for uuids and keys, which repeat across many location records.
+pub type Shared = Arc<str>;
+/// key -> set of UUIDs that currently have the content.
+pub type Locations = HashMap<Shared, HashSet<Shared>>;
+
+/// Hands out one shared allocation per distinct string.
+#[derive(Default)]
+pub struct Interner(HashSet<Shared>);
+
+impl Interner {
+    pub fn get(&mut self, s: &str) -> Shared {
+        if let Some(a) = self.0.get(s) {
+            return Arc::clone(a);
+        }
+        let a: Shared = Arc::from(s);
+        self.0.insert(Arc::clone(&a));
+        a
+    }
+}
+
+thread_local! {
+    static DESER_INTERNER: std::cell::RefCell<Option<Interner>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` (a deserialisation) with key/uuid interning on this thread, so repeated
+/// strings share one allocation from the start instead of being deduplicated later.
+pub fn with_interning<T>(f: impl FnOnce() -> T) -> T {
+    DESER_INTERNER.with(|c| *c.borrow_mut() = Some(Interner::default()));
+    let out = f();
+    DESER_INTERNER.with(|c| *c.borrow_mut() = None);
+    out
+}
+
+fn share(s: &str) -> Shared {
+    DESER_INTERNER.with(|c| match c.borrow_mut().as_mut() {
+        Some(i) => i.get(s),
+        None => Shared::from(s),
+    })
+}
+
+fn de_shared<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Shared, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(share(&s))
+}
+
+struct SharedSet(HashSet<Shared>);
+
+impl<'de> Deserialize<'de> for SharedSet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = SharedSet;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a list of uuids")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<SharedSet, A::Error> {
+                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(u) = seq.next_element::<String>()? {
+                    set.insert(share(&u));
+                }
+                Ok(SharedSet(set))
+            }
+        }
+        d.deserialize_seq(V)
+    }
+}
+
+fn de_locations<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Locations, D::Error> {
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Locations;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of key to uuids")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut m: A) -> Result<Locations, A::Error> {
+            let mut out = Locations::with_capacity(m.size_hint().unwrap_or(0));
+            while let Some(k) = m.next_key::<String>()? {
+                let set: SharedSet = m.next_value()?;
+                out.insert(share(&k), set.0);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_map(V)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -136,7 +227,8 @@ impl Remote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnnexedFile {
     pub path: String,
-    pub key: String,
+    #[serde(deserialize_with = "de_shared")]
+    pub key: Shared,
     /// Extracted size from key if E-style (e.g. SHA256E-s12345-...)
     pub size: Option<u64>,
 }
@@ -155,7 +247,8 @@ pub struct AnnexMetadata {
     /// All known UUIDs -> Remote (merged from uuid.log + remote.log + trusts)
     pub remotes: HashMap<String, Remote>,
     /// key -> set of UUIDs that currently have the content (latest record wins)
-    pub locations: HashMap<String, HashSet<String>>,
+    #[serde(deserialize_with = "de_locations")]
+    pub locations: Locations,
     /// Working tree annexed files
     pub files: Vec<AnnexedFile>,
     /// total keys known (from location logs)
@@ -279,6 +372,16 @@ impl AnnexMetadata {
         }
     }
 
+    /// Point each file's key at the matching location-log key, so a key
+    /// listed by `git annex find` is not stored twice.
+    pub fn share_file_keys(&mut self) {
+        for f in &mut self.files {
+            if let Some((k, _)) = self.locations.get_key_value(&f.key) {
+                f.key = Arc::clone(k);
+            }
+        }
+    }
+
     /// Drop remotes marked `git annex dead` (except this clone) and recount.
     /// Location logs often still list keys on retired machines; those rows
     /// inflate drive lists and consumed-size totals.
@@ -355,7 +458,7 @@ pub fn aggregate_remote_usage(summaries: &[RepoSummary]) -> Vec<(String, u64, us
 /// Untrusted and dead remotes are omitted — git-annex `numcopies` does the same
 /// (Glacier etc. store bytes but do not satisfy the copy requirement).
 pub fn copy_health_counts(
-    locations: &HashMap<String, HashSet<String>>,
+    locations: &Locations,
     numcopies: u32,
     remotes: &HashMap<String, Remote>,
 ) -> (usize, usize, usize) {
@@ -852,7 +955,7 @@ struct BranchLogs {
     /// Top-level logs by file name (`uuid.log`, `trust.log`, …).
     named: HashMap<String, String>,
     /// Per-key location logs: key -> UUIDs with content.
-    locations: HashMap<String, HashSet<String>>,
+    locations: Locations,
 }
 
 const NAMED_LOGS: &[&str] = &[
@@ -919,6 +1022,7 @@ fn read_branch_logs(root: &Path) -> Result<BranchLogs> {
         return Ok(logs);
     }
     let blobs = cat_file_batch(root, shas)?;
+    let mut uuid_names = Interner::default();
     logs.locations.reserve(targets.len());
     for (target, blob) in targets.into_iter().zip(blobs) {
         let Some(blob) = blob else {
@@ -932,7 +1036,8 @@ fn read_branch_logs(root: &Path) -> Result<BranchLogs> {
             Target::Location(key) => {
                 let uuids = parse_location_log(&text);
                 if !uuids.is_empty() {
-                    logs.locations.insert(key, uuids);
+                    let uuids = uuids.iter().map(|u| uuid_names.get(u)).collect();
+                    logs.locations.insert(Shared::from(key), uuids);
                 }
             }
         }
@@ -1050,11 +1155,8 @@ pub fn parse_size_from_key(key: &str) -> Option<u64> {
     None
 }
 
-fn collect_key_sizes(
-    files: &[AnnexedFile],
-    locations: &HashMap<String, HashSet<String>>,
-) -> HashMap<String, u64> {
-    let mut key_sizes: HashMap<String, u64> = HashMap::new();
+fn collect_key_sizes(files: &[AnnexedFile], locations: &Locations) -> HashMap<Shared, u64> {
+    let mut key_sizes: HashMap<Shared, u64> = HashMap::new();
     for f in files {
         if let Some(sz) = f.size {
             key_sizes.insert(f.key.clone(), sz);
@@ -1070,10 +1172,7 @@ fn collect_key_sizes(
     key_sizes
 }
 
-fn size_totals(
-    locations: &HashMap<String, HashSet<String>>,
-    key_sizes: &HashMap<String, u64>,
-) -> (u64, u64) {
+fn size_totals(locations: &Locations, key_sizes: &HashMap<Shared, u64>) -> (u64, u64) {
     let mut unique_size = 0u64;
     let mut consumed_size = 0u64;
     for (key, uuids) in locations {
@@ -1092,7 +1191,7 @@ fn size_totals(
 fn drop_dead_remotes(
     here: &str,
     remotes: &mut HashMap<String, Remote>,
-    locations: &mut HashMap<String, HashSet<String>>,
+    locations: &mut Locations,
 ) -> bool {
     let dead: HashSet<String> = remotes
         .iter()
@@ -1104,7 +1203,7 @@ fn drop_dead_remotes(
     }
     remotes.retain(|uuid, _| !dead.contains(uuid));
     for locs in locations.values_mut() {
-        locs.retain(|u| !dead.contains(u));
+        locs.retain(|u| !dead.contains(&**u));
     }
     locations.retain(|_, locs| !locs.is_empty());
     true
@@ -1112,21 +1211,22 @@ fn drop_dead_remotes(
 
 fn apply_present_stats(
     remotes: &mut HashMap<String, Remote>,
-    locations: &HashMap<String, HashSet<String>>,
-    key_sizes: &HashMap<String, u64>,
+    locations: &Locations,
+    key_sizes: &HashMap<Shared, u64>,
 ) {
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    let mut sizes: HashMap<String, u64> = HashMap::new();
+    let mut stats: HashMap<&str, (usize, u64)> = HashMap::new();
     for (key, uuids) in locations {
         let sz = key_sizes.get(key).copied().unwrap_or(0);
         for u in uuids {
-            *counts.entry(u.clone()).or_default() += 1;
-            *sizes.entry(u.clone()).or_default() += sz;
+            let e = stats.entry(u).or_default();
+            e.0 += 1;
+            e.1 += sz;
         }
     }
     for (u, r) in remotes.iter_mut() {
-        r.present_count = counts.get(u).copied().unwrap_or(0);
-        r.present_size = sizes.get(u).copied().unwrap_or(0);
+        let (count, size) = stats.get(u.as_str()).copied().unwrap_or_default();
+        r.present_count = count;
+        r.present_size = size;
     }
 }
 
@@ -1161,7 +1261,11 @@ pub fn parse_find_nul_triplets(buf: &[u8]) -> Vec<AnnexedFile> {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|&n| n > 0);
         let size = parsed.or_else(|| parse_size_from_key(&key));
-        out.push(AnnexedFile { path, key, size });
+        out.push(AnnexedFile {
+            path,
+            key: key.into(),
+            size,
+        });
     }
     out
 }
@@ -1271,7 +1375,11 @@ fn lookup_keys_for_paths(root: &Path, paths: &[String]) -> Vec<AnnexedFile> {
         {
             let path = paths[i].clone();
             let size = parse_size_from_key(&key);
-            files.push(AnnexedFile { path, key, size });
+            files.push(AnnexedFile {
+                path,
+                key: key.into(),
+                size,
+            });
         }
     }
     let _ = child.wait();
@@ -1466,7 +1574,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         desc
     };
 
-    Ok(AnnexMetadata {
+    let mut meta = AnnexMetadata {
         root,
         uuid,
         description,
@@ -1479,7 +1587,9 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         unique_size,
         consumed_size,
         fingerprint,
-    })
+    };
+    meta.share_file_keys();
+    Ok(meta)
 }
 
 /// Return a short human name for a UUID (prefers name in config or desc)
@@ -1934,7 +2044,7 @@ u2 something else timestamp=9s
         assert!(meta.remotes.contains_key("disk"));
         assert_eq!(
             meta.locations.get("SHA256E-s100--aa").unwrap(),
-            &HashSet::from(["here".to_string()])
+            &HashSet::from([Shared::from("here")])
         );
         assert!(!meta.locations.contains_key("SHA256E-s50--bb"));
         assert_eq!(meta.unique_size, 110);
@@ -1994,6 +2104,24 @@ u2 something else timestamp=9s
         meta.ensure_sizes();
         assert!(!meta.remotes.contains_key("dead-box"));
         assert_eq!(meta.consumed_size, 20);
+    }
+
+    #[test]
+    fn cache_round_trip_shares_keys_and_uuids() {
+        let json = serde_json::to_string(&crate::testutil::sample_meta()).unwrap();
+        let m: AnnexMetadata = with_interning(|| serde_json::from_str(&json).unwrap());
+        let f = &m.files[0];
+        let (loc_key, uuids) = m.locations.get_key_value(&f.key).unwrap();
+        assert!(Arc::ptr_eq(loc_key, &f.key));
+        let here_a = uuids.get("here").unwrap();
+        let other = m
+            .locations
+            .values()
+            .find_map(|s| s.get("here").filter(|u| !Arc::ptr_eq(u, here_a)));
+        assert!(
+            other.is_none(),
+            "every 'here' uuid should be one allocation"
+        );
     }
 
     #[test]
