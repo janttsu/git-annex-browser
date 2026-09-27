@@ -1151,3 +1151,70 @@ impl Node for AnnexFileNode {
         file_raw(&self.meta, &self.file)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::sample_meta;
+
+    fn labels(n: &dyn Node) -> Vec<String> {
+        n.children().iter().map(|c| c.label()).collect()
+    }
+
+    #[test]
+    fn file_tree_lists_dirs_first_then_files() {
+        let tree = FileTreeNode::all_files(Arc::new(sample_meta()));
+        let top = labels(&tree);
+        assert_eq!(top[0], "2023/");
+        assert_eq!(top[1], "2024/");
+        assert!(top[2].starts_with("notes.txt"), "{top:?}");
+        let y2024 = &tree.children()[1];
+        let inner = labels(y2024.as_ref());
+        assert_eq!(inner[0], "raw/");
+        assert!(inner[1].starts_with("2024/a.jpg"), "{inner:?}");
+    }
+
+    #[test]
+    fn drive_tree_filters_by_drive_and_shows_unused_keys() {
+        let mut m = sample_meta();
+        m.locations.insert(
+            "SHA256E-s7--old".into(),
+            [crate::annex::Shared::from("usb")].into_iter().collect(),
+        );
+        let tree = FileTreeNode::on_drive(Arc::new(m), "usb".into(), "usb".into());
+        assert_eq!(tree.label(), "files on usb (4)");
+        let top = labels(&tree);
+        assert!(top.contains(&"2024/".to_string()), "{top:?}");
+        assert!(
+            !top.contains(&"2023/".to_string()),
+            "2023 has no usb copy: {top:?}"
+        );
+        assert!(
+            top.iter()
+                .any(|l| l.starts_with("<unused key> SHA256E-s7--old"))
+        );
+    }
+
+    #[test]
+    fn repo_menu_offers_risk_and_fetch_plan() {
+        let node = RepoNode::new(Arc::new(sample_meta()), Rc::new(HashMap::new()));
+        let menu = labels(&node);
+        assert!(
+            menu.iter().any(|l| l.starts_with("at risk: 4 files")),
+            "{menu:?}"
+        );
+        assert!(
+            menu.iter().any(|l| l.starts_with("missing here: 3 files")),
+            "{menu:?}"
+        );
+    }
+
+    #[test]
+    fn file_details_star_the_highlighted_drive() {
+        let m = sample_meta();
+        let f = m.files.iter().find(|f| f.path == "2024/a.jpg").unwrap();
+        let d = file_details(&m, f, Some("usb"));
+        assert!(d.iter().any(|l| l.trim() == "usb ? ★"), "{d:?}");
+        assert!(d.iter().any(|l| l.trim() == "here T"), "{d:?}");
+    }
+}
