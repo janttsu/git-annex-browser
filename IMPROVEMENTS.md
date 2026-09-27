@@ -8,6 +8,49 @@ mainita. Mittapisteenä käytetty tämän koneen välimuisti: 11 repoa, 30 MB `c
 
 Rivinumerot viittaavat yllä mainittuun commitiin.
 
+## Toteutustila (päivitetty 2026-09-27)
+
+Kaikki alla luetellut kohdat on toteutettu haarassa `worktree-improvements-doc`.
+Testejä on nyt 63, kun alussa niitä oli 29. Clippy on puhdas. Mittaukset on tehty tämän
+koneen 11 oikealla annexilla väliaikaista välimuistia vasten.
+
+| Kohta | Tila | Huomio |
+|------|------|--------|
+| 1.1 käyttöpuu joka näppäimellä | tehty | Puu rakennetaan kerran per avattu repo. |
+| 1.2 summaryjen kloonaus | tehty | Solmut jakavat `Rc<[RepoSummary]>`-listan; lapsilistat välimuistissa. |
+| 1.3 työntekijä estyy | tehty | Discovery, välimuistin luku, lataukset ja kirjoitus omissa säikeissään. `whereis`-fallback poistettu. |
+| 1.4 turha piirto | tehty | Piirretään vain viestin, näppäimen, hiiren tai koon muutoksen jälkeen. |
+| 1.5 `git rev-parse` jokaiselle repolle | tehty | Refit luetaan levyltä; `--max-depth` ja `--one-file-system` lisätty. |
+| 1.6 ~14 git-prosessia per repo | tehty | Nyt noin 4. Lämpimällä levyvälimuistilla aika ei muuttunut (git annex find hallitsee); hyöty näkyy hitailla levyillä. |
+| 2.1 koko välimuisti joka tallennuksella | tehty, poikkeama | Yksi JSON-tiedosto per repo + indeksi. Binääriformaattia (postcard/zstd) ei otettu: jako per repo poisti kustannuksen ja JSON pysyy luettavana. Koko 30 MB → 22 MB. |
+| 2.2 `Rc` → `Arc` | tehty | |
+| 2.3 turha uudelleenhydratointi | tehty | Sormenjälki: git-annex-haara, HEAD ja configin mtime. Toistuva `--scan`: 54 s → 1 s. |
+| 2.4 poistuneet repot | tehty | Näytetään "not found since …"; `--prune` poistaa. |
+| 3.1 tyhjä metadata | tehty | |
+| 3.2 UTF-8-paniikki | tehty | |
+| 3.3 `q`/`Esc` ohjeessa | tehty | Esc ei enää koskaan lopeta. |
+| 3.4 taustapäivitys hylätään | tehty, tarkennus | Tarkemmin katsottuna Nav-vastaus sisältää aina uusimman tilan, joten tietoa ei hävinnyt. Status ja skannaustila kopioidaan silti heti. |
+| 3.5 statusrivi | tehty | Vihjeet pudotetaan leveyden mukaan; "hex-ish" korjattu. |
+| 3.6 suodatin kahdessa paikassa | tehty | |
+| 4.1 uuid-kopiot | tehty, poikkeama | `Arc<str>`-internointi deserialisoinnin aikana indeksitaulukon sijaan. `--dump` huippumuisti 55 → 36 MiB. |
+| 5.1 toisto | tehty | Kolme hakemistopuuta yhdeksi, yhteinen lokiparseri, `Remote::new`, `RepoSummary::placeholder`, yhteinen `scan`-moduuli. |
+| 5.2 `NodeKind` | tehty | |
+| 5.3 `UiState` | tehty | Näppäin- ja hiirikäsittely testataan ilman terminaalia. |
+| 5.4 kuollut koodi | tehty | Vapaan tilan laskenta poistettiin (ei näytetty). |
+| 6 käytettävyys | tehty | Esc, lajittelu `s`, J/K ja Ctrl+d/u, leveystietoinen katkaisu, hiiri, `↓`-merkki, "at risk" ja "missing here" -näkymät. |
+| 7 testit ja CI | tehty, osin | git-annex CI:ssä, MSRV- ja audit-jobit, release-workflow. `cargo publish` jätetty tekemättä: vaatii crates.io-tilin ja päätöksen. MSRV 1.89 tarkistuu vasta CI:ssä, koska koneella ei ole rustupia. |
+| 8 CLI | tehty | `--json`, `--cache`, `--offline`, `--jobs`, `--max-depth`, `--one-file-system`, `--force-rescan`, `--prune`. |
+| 9 riippuvuudet | tehty | chrono ja suora libc-riippuvuus poistettu; `rust-version = "1.89"`. |
+
+Käyttäytymismuutokset, jotka kannattaa tietää:
+
+- Välimuisti on uudessa paikassa `~/.cache/git-annex-browser/v2/`. Vanha `cache.json` tuodaan kerran eikä sitä poisteta.
+- `--scan` palauttaa virhekoodin, jos jonkin repon lataus tai tallennus epäonnistuu.
+- `--dump` ei enää lataa muuttumattomia repoja uudelleen; `--force-rescan` pakottaa.
+- Esc ei lopeta ohjelmaa; vain `q` ja Ctrl+C.
+- Ajat näytetään muodossa `YYYY-MM-DD HH:MM UTC`.
+- `git annex numcopies` -asetus ohittaa vanhan `annex.numcopies`-git-configin, kuten git-annexissa.
+
 ## Priorisointi
 
 | # | Aihe | Vaikutus | Työmäärä |
