@@ -62,10 +62,6 @@ pub struct Remote {
     /// Sum of those keys' sizes (from key names when available)
     #[serde(default)]
     pub present_size: u64,
-    /// Filesystem free bytes for this drive (if we could determine a local path for it)
-    /// Note: no longer displayed by default as it's not git-annex metadata.
-    #[serde(default)]
-    pub available_space: Option<u64>,
     #[serde(default)]
     pub groups: Vec<String>,
     #[serde(default)]
@@ -75,6 +71,27 @@ pub struct Remote {
 }
 
 impl Remote {
+    pub fn new(
+        uuid: String,
+        description: String,
+        config: HashMap<String, String>,
+        trust: TrustLevel,
+        last_fsck: Option<i64>,
+    ) -> Self {
+        Self {
+            uuid,
+            description,
+            config,
+            trust,
+            last_fsck,
+            present_count: 0,
+            present_size: 0,
+            groups: vec![],
+            wanted: None,
+            required: None,
+        }
+    }
+
     pub fn name(&self) -> &str {
         self.config
             .get("name")
@@ -129,7 +146,6 @@ pub struct AnnexMetadata {
     pub root: PathBuf,
     pub uuid: String,
     pub description: String,
-    pub version: Option<u32>,
     /// Default numcopies for this repo
     #[serde(default)]
     pub numcopies: Option<u32>,
@@ -153,7 +169,7 @@ pub struct AnnexMetadata {
 }
 
 /// Lightweight summary for fast top-level listing and caching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoSummary {
     pub root: PathBuf,
     pub uuid: String,
@@ -166,7 +182,6 @@ pub struct RepoSummary {
     pub file_count: usize,
     pub remote_count: usize,
     pub here_present_count: usize,
-    pub here_available_space: Option<u64>,
     /// Sum of sizes of all unique keys (1 copy each)
     #[serde(default)]
     pub unique_size: u64,
@@ -240,7 +255,6 @@ impl AnnexMetadata {
             file_count: self.files.len(),
             remote_count: self.remotes.len(),
             here_present_count: here_present,
-            here_available_space: None, // no longer populated
             unique_size: self.unique_size,
             consumed_size: self.consumed_size,
             remote_usage: self
@@ -387,6 +401,16 @@ pub fn remote_name_stats(summaries: &[RepoSummary]) -> (usize, usize) {
 }
 
 impl RepoSummary {
+    /// Minimal entry for a discovered repo whose metadata is not loaded yet.
+    pub fn placeholder(root: PathBuf) -> Self {
+        let mut s = RepoSummary {
+            root,
+            ..Default::default()
+        };
+        s.ensure_name();
+        s
+    }
+
     /// Ensure we have a usable display name (for old caches or minimal entries)
     pub fn ensure_name(&mut self) {
         if self.name.is_empty() {
@@ -515,92 +539,62 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Parse uuid.log. Last-write-wins per UUID using the line timestamp.
-fn parse_uuid_log(text: &str) -> Vec<(String, String, Option<i64>)> {
-    let mut latest: HashMap<String, (i64, String)> = HashMap::new();
+/// Last-write-wins per UUID for branch logs shaped `UUID <body> timestamp=…s`.
+/// `parse` receives the body after the UUID (without the timestamp).
+fn latest_per_uuid<T>(text: &str, parse: impl Fn(&str) -> Option<T>) -> HashMap<String, T> {
+    let mut latest: HashMap<String, (i64, T)> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
         let (body, ts) = split_log_timestamp(line);
-        let mut parts = body.splitn(2, ' ');
-        let uuid = parts.next().unwrap_or("").to_string();
+        let (uuid, rest) = body.split_once(' ').unwrap_or((body, ""));
         if uuid.is_empty() {
             continue;
         }
-        let desc = parts.next().unwrap_or("").trim().to_string();
-        let desc = if desc.is_empty() { uuid.clone() } else { desc };
+        let Some(value) = parse(rest.trim()) else {
+            continue;
+        };
         let ts = ts.unwrap_or(0);
-        match latest.get(&uuid) {
+        match latest.get(uuid) {
             Some((old, _)) if ts < *old => {}
             _ => {
-                latest.insert(uuid, (ts, desc));
+                latest.insert(uuid.to_string(), (ts, value));
             }
         }
     }
-    latest
-        .into_iter()
-        .map(|(uuid, (ts, desc))| (uuid, desc, Some(ts)))
-        .collect()
+    latest.into_iter().map(|(u, (_, v))| (u, v)).collect()
+}
+
+/// Parse uuid.log. Last-write-wins per UUID using the line timestamp.
+fn parse_uuid_log(text: &str) -> HashMap<String, String> {
+    latest_per_uuid(text, |desc| Some(desc.to_string()))
 }
 
 fn parse_remote_log(text: &str) -> HashMap<String, HashMap<String, String>> {
-    let mut latest: HashMap<String, (i64, HashMap<String, String>)> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (body, ts) = split_log_timestamp(line);
-        let mut it = body.split_whitespace();
-        let Some(uuid) = it.next().filter(|u| !u.is_empty()) else {
-            continue;
-        };
+    latest_per_uuid(text, |body| {
         let mut cfg = HashMap::new();
-        for tok in it {
+        for tok in body.split_whitespace() {
             if let Some((k, v)) = tok.split_once('=') {
-                if is_secret_remote_key(k) {
-                    cfg.insert(k.to_string(), "[redacted]".to_string());
+                let v = if is_secret_remote_key(k) {
+                    "[redacted]".to_string()
                 } else {
-                    cfg.insert(k.to_string(), v.to_string());
-                }
+                    v.to_string()
+                };
+                cfg.insert(k.to_string(), v);
             }
         }
-        let ts = ts.unwrap_or(0);
-        match latest.get(uuid) {
-            Some((old, _)) if ts < *old => {}
-            _ => {
-                latest.insert(uuid.to_string(), (ts, cfg));
-            }
-        }
-    }
-    latest.into_iter().map(|(u, (_, cfg))| (u, cfg)).collect()
+        Some(cfg)
+    })
 }
 
 fn parse_trust_log(text: &str) -> HashMap<String, TrustLevel> {
-    let mut latest: HashMap<String, (i64, TrustLevel)> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (body, ts) = split_log_timestamp(line);
-        let mut parts = body.split_whitespace();
-        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        let flag = parts.next().unwrap_or("?");
-        let lvl = TrustLevel::from_token(flag);
-        let ts = ts.unwrap_or(0);
-        match latest.get(uuid) {
-            Some((old, _)) if ts < *old => {}
-            _ => {
-                latest.insert(uuid.to_string(), (ts, lvl));
-            }
-        }
-    }
-    latest.into_iter().map(|(u, (_, t))| (u, t)).collect()
+    latest_per_uuid(text, |body| {
+        Some(TrustLevel::from_token(
+            body.split_whitespace().next().unwrap_or("?"),
+        ))
+    })
 }
 
 fn parse_activity_log(text: &str) -> HashMap<String, i64> {
@@ -632,58 +626,17 @@ fn parse_activity_log(text: &str) -> HashMap<String, i64> {
 fn parse_group_log(text: &str) -> HashMap<String, Vec<String>> {
     // Official format: UUID group1 group2 ... timestamp=UNIX.s
     // The line with the highest timestamp is the complete current set.
-    let mut latest: HashMap<String, (i64, Vec<String>)> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (body, ts) = split_log_timestamp(line);
-        let mut parts = body.split_whitespace();
-        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        let mut groups: Vec<String> = parts
-            .filter(|g| !g.is_empty() && !g.starts_with("timestamp="))
-            .map(|g| g.to_string())
-            .collect();
+    latest_per_uuid(text, |body| {
+        let mut groups: Vec<String> = body.split_whitespace().map(str::to_string).collect();
         groups.sort();
         groups.dedup();
-        let ts = ts.unwrap_or(0);
-        match latest.get(uuid) {
-            Some((old, _)) if ts < *old => {}
-            _ => {
-                latest.insert(uuid.to_string(), (ts, groups));
-            }
-        }
-    }
-    latest.into_iter().map(|(u, (_, g))| (u, g)).collect()
+        Some(groups)
+    })
 }
 
 fn parse_content_log(text: &str) -> HashMap<String, String> {
-    // preferred-content.log / required-content.log:
-    // uuid <expression> timestamp=...
-    let mut latest: HashMap<String, (i64, String)> = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (body, ts) = split_log_timestamp(line);
-        let mut parts = body.splitn(2, ' ');
-        let Some(uuid) = parts.next().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        let expr = parts.next().unwrap_or("").trim().to_string();
-        let ts = ts.unwrap_or(0);
-        match latest.get(uuid) {
-            Some((old, _)) if ts < *old => {}
-            _ => {
-                latest.insert(uuid.to_string(), (ts, expr));
-            }
-        }
-    }
-    latest.into_iter().map(|(u, (_, e))| (u, e)).collect()
+    // preferred-content.log / required-content.log: uuid <expression> timestamp=...
+    latest_per_uuid(text, |expr| Some(expr.to_string()))
 }
 
 /// Path of a per-key location log on the git-annex branch (`xx/yy/KEY.log`).
@@ -1222,32 +1175,18 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Build remotes map. Start from uuid.log entries + remotes
     let mut remotes: HashMap<String, Remote> = HashMap::new();
 
-    for (u, d, _ts) in &uuid_entries {
+    for (u, d) in &uuid_entries {
         let cfg = remote_cfgs.get(u).cloned().unwrap_or_default();
         let trust = trusts.get(u).copied().unwrap_or(TrustLevel::SemiTrusted);
         let last_fsck = fscks.get(u).copied();
-        let description = if d == u && cfg.contains_key("name") {
-            cfg.get("name").unwrap().clone()
-        } else if d.is_empty() {
-            u.clone()
-        } else {
-            d.clone()
+        let description = match cfg.get("name") {
+            Some(name) if d.is_empty() || d == u => name.clone(),
+            _ if d.is_empty() => u.clone(),
+            _ => d.clone(),
         };
         remotes.insert(
             u.clone(),
-            Remote {
-                uuid: u.clone(),
-                description,
-                config: cfg,
-                trust,
-                last_fsck,
-                present_count: 0,
-                present_size: 0,
-                available_space: None,
-                groups: vec![],
-                wanted: None,
-                required: None,
-            },
+            Remote::new(u.clone(), description, cfg, trust, last_fsck),
         );
     }
 
@@ -1259,19 +1198,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
             let description = cfg.get("name").cloned().unwrap_or_else(|| u.clone());
             remotes.insert(
                 u.clone(),
-                Remote {
-                    uuid: u.clone(),
-                    description,
-                    config: cfg.clone(),
-                    trust,
-                    last_fsck,
-                    present_count: 0,
-                    present_size: 0,
-                    available_space: None,
-                    groups: vec![],
-                    wanted: None,
-                    required: None,
-                },
+                Remote::new(u.clone(), description, cfg.clone(), trust, last_fsck),
             );
         }
     }
@@ -1282,26 +1209,20 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         cfg.insert("name".to_string(), "here".to_string());
         remotes.insert(
             uuid.clone(),
-            Remote {
-                uuid: uuid.clone(),
-                description: if desc.is_empty() {
+            Remote::new(
+                uuid.clone(),
+                if desc.is_empty() {
                     "here".to_string()
                 } else {
                     desc.clone()
                 },
-                config: cfg,
-                trust: trusts
+                cfg,
+                trusts
                     .get(&uuid)
                     .copied()
                     .unwrap_or(TrustLevel::SemiTrusted),
-                last_fsck: fscks.get(&uuid).copied(),
-                present_count: 0,
-                present_size: 0,
-                available_space: None,
-                groups: vec![],
-                wanted: None,
-                required: None,
-            },
+                fscks.get(&uuid).copied(),
+            ),
         );
     }
 
@@ -1342,10 +1263,6 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         }
     }
 
-    // Fill drive space information for any remotes that have a resolvable local path
-    // (kept for internal use / old caches, but not shown in UI by default)
-    fill_drive_spaces(&root, &uuid, &mut remotes);
-
     // Working-tree / HEAD annexed files. Sizes come from git-annex (key / bytesize),
     // so dropped or missing content is still listed.
     let files = load_annexed_files(&root);
@@ -1364,9 +1281,9 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Fill local desc if empty
     let description = if desc.is_empty() {
         uuid_entries
-            .iter()
-            .find(|(u, _d, _)| u == &uuid)
-            .map(|(_, d, _)| d.clone())
+            .get(&uuid)
+            .filter(|d| !d.is_empty())
+            .cloned()
             .unwrap_or_else(|| uuid.clone())
     } else {
         desc
@@ -1376,7 +1293,6 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         root,
         uuid,
         description,
-        version: None,
         numcopies,
         additional_configs,
         remotes,
@@ -1402,56 +1318,7 @@ pub fn short_name(meta: &AnnexMetadata, uuid: &str) -> String {
                 r.description.clone()
             }
         })
-        .unwrap_or_else(|| uuid[..8.min(uuid.len())].to_string())
-}
-
-/// Best effort local filesystem path for a remote (for space queries).
-fn remote_drive_path(rem: &Remote, repo_root: &Path, here_uuid: &str) -> Option<PathBuf> {
-    if let Some(dir) = rem.config.get("directory") {
-        let p = PathBuf::from(dir);
-        // Only return if it currently exists (drive may be unmounted)
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if rem.uuid == here_uuid {
-        return Some(repo_root.to_path_buf());
-    }
-    None
-}
-
-/// Fill available_space for drives that map to local directories.
-fn fill_drive_spaces(repo_root: &Path, here_uuid: &str, remotes: &mut HashMap<String, Remote>) {
-    for r in remotes.values_mut() {
-        if let Some(p) = remote_drive_path(r, repo_root, here_uuid)
-            && let Some((avail, _total)) = get_fs_space(&p)
-        {
-            r.available_space = Some(avail);
-        }
-    }
-}
-
-/// Query filesystem available and total bytes for a path using statvfs (Linux).
-#[cfg(unix)]
-pub fn get_fs_space(path: &Path) -> Option<(u64, u64)> {
-    use libc::statvfs;
-    use std::ffi::CString;
-    let cpath = CString::new(path.to_str()?).ok()?;
-    let mut st: statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: cpath is valid nul-terminated, st is properly sized.
-    if unsafe { statvfs(cpath.as_ptr(), &mut st) } == 0 {
-        let bsize = st.f_frsize as u64; // or f_bsize on some systems
-        let avail = (st.f_bavail as u64).saturating_mul(bsize);
-        let total = (st.f_blocks as u64).saturating_mul(bsize);
-        Some((avail, total))
-    } else {
-        None
-    }
-}
-
-#[cfg(not(unix))]
-pub fn get_fs_space(_path: &Path) -> Option<(u64, u64)> {
-    None
+        .unwrap_or_else(|| uuid.chars().take(8).collect())
 }
 
 // ---------------------- Cache (local DB file) ----------------------
@@ -1579,14 +1446,7 @@ fn lock_cache() -> Result<CacheLock> {
         .read(true)
         .write(true)
         .open(dir.join("cache.lock"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if rc != 0 {
-            anyhow::bail!("could not lock cache");
-        }
-    }
+    file.lock().context("locking cache")?;
     Ok(CacheLock { _file: file })
 }
 
@@ -1642,12 +1502,6 @@ fn write_cache_unlocked(cache: &AnnexCache) -> Result<()> {
         let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn save_cache(cache: &AnnexCache) -> Result<()> {
-    let _lock = lock_cache()?;
-    write_cache_unlocked(cache)
 }
 
 /// Replace cached entries under `scan_root` with `found`; keep everything else.
@@ -1731,16 +1585,8 @@ e605dca6-446a-11e0-8b2a-002170d25c55 new laptop name timestamp=2000000000.0s
 e605dca6-446a-11e0-8b2a-002170d25c55 stale timestamp=1000s
 ";
         let v = parse_uuid_log(text);
-        let laptop = v
-            .iter()
-            .find(|(u, _, _)| u.starts_with("e605dca6"))
-            .unwrap();
-        assert_eq!(laptop.1, "new laptop name");
-        let usb = v
-            .iter()
-            .find(|(u, _, _)| u.starts_with("26339d22"))
-            .unwrap();
-        assert_eq!(usb.1, "usb disk");
+        assert_eq!(v["e605dca6-446a-11e0-8b2a-002170d25c55"], "new laptop name");
+        assert_eq!(v["26339d22-446b-11e0-9101-002170d25c55"], "usb disk");
     }
 
     #[test]
@@ -1882,7 +1728,6 @@ u2 something else timestamp=9s
             root: PathBuf::from(root),
             uuid: "u".into(),
             description: String::new(),
-            version: None,
             numcopies: None,
             additional_configs: vec![],
             remotes: HashMap::new(),
@@ -1923,22 +1768,10 @@ u2 something else timestamp=9s
         }
         fn summary(usage: Vec<RemoteUsage>) -> RepoSummary {
             RepoSummary {
-                root: PathBuf::from("/r"),
-                uuid: String::new(),
                 name: "r".into(),
-                annex_description: String::new(),
-                file_count: 0,
                 remote_count: usage.len(),
-                here_present_count: 0,
-                here_available_space: None,
-                unique_size: 0,
-                consumed_size: 0,
                 remote_usage: usage,
-                numcopies: None,
-                keys_tracked: 0,
-                keys_under: 0,
-                keys_ok: 0,
-                keys_over: 0,
+                ..RepoSummary::placeholder(PathBuf::from("/r"))
             }
         }
         let rows = aggregate_remote_usage(&[
@@ -1971,22 +1804,10 @@ u2 something else timestamp=9s
         }
         fn summary(usage: Vec<RemoteUsage>) -> RepoSummary {
             RepoSummary {
-                root: PathBuf::from("/r"),
-                uuid: String::new(),
                 name: "r".into(),
-                annex_description: String::new(),
-                file_count: 0,
                 remote_count: usage.len(),
-                here_present_count: 0,
-                here_available_space: None,
-                unique_size: 0,
-                consumed_size: 0,
                 remote_usage: usage,
-                numcopies: None,
-                keys_tracked: 0,
-                keys_under: 0,
-                keys_ok: 0,
-                keys_over: 0,
+                ..RepoSummary::placeholder(PathBuf::from("/r"))
             }
         }
         let (unique, summed) = remote_name_stats(&[
@@ -2037,19 +1858,7 @@ u2 something else timestamp=9s
         ] {
             remotes.insert(
                 uuid.to_string(),
-                Remote {
-                    uuid: uuid.into(),
-                    description: uuid.into(),
-                    config: HashMap::new(),
-                    trust,
-                    last_fsck: None,
-                    present_count: 0,
-                    present_size: 0,
-                    available_space: None,
-                    groups: vec![],
-                    wanted: None,
-                    required: None,
-                },
+                Remote::new(uuid.into(), uuid.into(), HashMap::new(), trust, None),
             );
         }
         // numcopies=1: only-glacier is under (untrusted doesn't count), others ok/over
@@ -2058,19 +1867,7 @@ u2 something else timestamp=9s
     }
 
     fn remote(uuid: &str, trust: TrustLevel) -> Remote {
-        Remote {
-            uuid: uuid.into(),
-            description: uuid.into(),
-            config: HashMap::new(),
-            trust,
-            last_fsck: None,
-            present_count: 0,
-            present_size: 0,
-            available_space: None,
-            groups: vec![],
-            wanted: None,
-            required: None,
-        }
+        Remote::new(uuid.into(), uuid.into(), HashMap::new(), trust, None)
     }
 
     #[test]
