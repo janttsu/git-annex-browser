@@ -13,9 +13,58 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+/// What a row in the browser represents. Drives colours, visuals and navigation rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NodeKind {
+    Root,
+    Report,
+    Repo,
+    Here,
+    Drive,
+    Drives,
+    Info,
+    Files,
+    Dir,
+    File,
+    Usage,
+    Viz,
+    Parent,
+}
+
+impl NodeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            NodeKind::Root => "root",
+            NodeKind::Report => "report",
+            NodeKind::Repo => "repo",
+            NodeKind::Here => "here",
+            NodeKind::Drive => "drive",
+            NodeKind::Drives => "drives",
+            NodeKind::Info => "info",
+            NodeKind::Files => "files",
+            NodeKind::Dir => "dir",
+            NodeKind::File => "file",
+            NodeKind::Usage => "usage",
+            NodeKind::Viz => "viz",
+            NodeKind::Parent => "parent",
+        }
+    }
+
+    /// Dashboards that zoom instead of descending.
+    pub fn is_visual(self) -> bool {
+        matches!(self, NodeKind::Report | NodeKind::Viz)
+    }
+}
+
+impl std::fmt::Display for NodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 pub trait Node {
     fn label(&self) -> String;
-    fn kind(&self) -> &'static str;
+    fn kind(&self) -> NodeKind;
     fn children(&self) -> Vec<Rc<dyn Node>> {
         vec![]
     }
@@ -60,6 +109,10 @@ pub trait Node {
     fn usage_listing(&self) -> Option<UsageListing> {
         None
     }
+    /// Some keys have fewer counting copies than numcopies.
+    fn under_copies(&self) -> bool {
+        false
+    }
 }
 
 /// Top level: discovered repos under the scan dir.
@@ -81,8 +134,8 @@ impl Node for RootNode {
     fn label(&self) -> String {
         format!("scan: {}", self.scan_root.display())
     }
-    fn kind(&self) -> &'static str {
-        "root"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Root
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(GlobalReportNode {
@@ -115,8 +168,8 @@ impl Node for GlobalReportNode {
     fn label(&self) -> String {
         "Global report (all repos)".into()
     }
-    fn kind(&self) -> &'static str {
-        "report"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Report
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         vec![]
@@ -187,8 +240,8 @@ impl Node for RepoLoadingNode {
     fn label(&self) -> String {
         format!("{} (loading...)", self.path.display())
     }
-    fn kind(&self) -> &'static str {
-        "repo"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Repo
     }
     fn details(&self) -> Vec<String> {
         vec!["Loading git-annex metadata in background...".into()]
@@ -216,14 +269,17 @@ impl Node for RepoSummaryNode {
             s.name, desc, s.file_count, s.remote_count
         )
     }
-    fn kind(&self) -> &'static str {
-        "repo"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Repo
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         vec![]
     }
     fn annex_repo_path(&self) -> Option<&std::path::Path> {
         Some(&self.summary.root)
+    }
+    fn under_copies(&self) -> bool {
+        self.summary.keys_under > 0
     }
     fn details(&self) -> Vec<String> {
         let s = &self.summary;
@@ -287,8 +343,8 @@ impl Node for RepoNode {
             format!("{} [{}]", clean_name, short)
         }
     }
-    fn kind(&self) -> &'static str {
-        "repo"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Repo
     }
     fn loaded_repo_path(&self) -> Option<&std::path::Path> {
         Some(&self.meta.root)
@@ -356,8 +412,8 @@ impl Node for RepoInfoNode {
     fn label(&self) -> String {
         "info / summary".into()
     }
-    fn kind(&self) -> &'static str {
-        "info"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Info
     }
     fn details(&self) -> Vec<String> {
         let m = &self.meta;
@@ -439,8 +495,8 @@ impl Node for RepoVisualNode {
     fn label(&self) -> String {
         "visual overview".into()
     }
-    fn kind(&self) -> &'static str {
-        "viz"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Viz
     }
     fn loaded_repo_path(&self) -> Option<&std::path::Path> {
         Some(&self.root)
@@ -462,8 +518,8 @@ impl Node for DrivesNode {
     fn label(&self) -> String {
         format!("drives / remotes ({})", self.meta.remotes.len())
     }
-    fn kind(&self) -> &'static str {
-        "drives"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Drives
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         let mut list: Vec<_> = self.meta.remotes.values().cloned().collect();
@@ -575,13 +631,13 @@ impl Node for DriveNode {
             sz
         )
     }
-    fn kind(&self) -> &'static str {
+    fn kind(&self) -> NodeKind {
         if self.remote.uuid == self.meta.uuid {
-            "here"
+            NodeKind::Here
         } else if self.remote.is_special() {
-            "drive"
+            NodeKind::Drive
         } else {
-            "repo"
+            NodeKind::Repo
         }
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
@@ -679,8 +735,8 @@ impl Node for DriveInfoNode {
     fn label(&self) -> String {
         "drive info".into()
     }
-    fn kind(&self) -> &'static str {
-        "info"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Info
     }
     fn details(&self) -> Vec<String> {
         let r = &self.remote;
@@ -732,8 +788,8 @@ impl Node for FilesOnDriveNode {
             .count();
         format!("files on {} ({})", self.drive_name, cnt)
     }
-    fn kind(&self) -> &'static str {
-        "files"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Files
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         let mut cache = self.cached_children.borrow_mut();
@@ -795,7 +851,7 @@ impl Node for FilesOnDriveNode {
 
         // Sort: dirs first, then files
         out.sort_by_key(|n| {
-            let is_dir = n.kind() == "dir";
+            let is_dir = n.kind() == NodeKind::Dir;
             (if is_dir { 0 } else { 1 }, n.label())
         });
         *cache = Some(out.clone());
@@ -848,8 +904,8 @@ impl Node for AnnexFileNode {
         };
         format!("{}{}", base, badge)
     }
-    fn kind(&self) -> &'static str {
-        "file"
+    fn kind(&self) -> NodeKind {
+        NodeKind::File
     }
     fn details(&self) -> Vec<String> {
         let mut d = vec![
@@ -934,8 +990,8 @@ impl Node for DirectoryNode {
             )
         }
     }
-    fn kind(&self) -> &'static str {
-        "dir"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Dir
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         let mut cache = self.cached_children.borrow_mut();
@@ -995,7 +1051,7 @@ impl Node for DirectoryNode {
             }) as Rc<dyn Node>);
         }
         kids.sort_by_key(|k| {
-            let is_dir = k.kind() == "dir";
+            let is_dir = k.kind() == NodeKind::Dir;
             (if is_dir { 0 } else { 1 }, k.label())
         });
         *cache = Some(kids.clone());
@@ -1023,8 +1079,8 @@ impl Node for AllFilesNode {
     fn label(&self) -> String {
         format!("all annexed files ({})", self.meta.files.len())
     }
-    fn kind(&self) -> &'static str {
-        "files"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Files
     }
     fn children(&self) -> Vec<Rc<dyn Node>> {
         let mut cache = self.cached_children.borrow_mut();
@@ -1058,7 +1114,7 @@ impl Node for AllFilesNode {
             }) as Rc<dyn Node>);
         }
         v.sort_by_key(|n| {
-            let is_dir = n.kind() == "dir";
+            let is_dir = n.kind() == NodeKind::Dir;
             (if is_dir { 0 } else { 1 }, n.label())
         });
         *cache = Some(v.clone());

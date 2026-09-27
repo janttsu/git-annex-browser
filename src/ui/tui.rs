@@ -2,7 +2,11 @@
 TUI rendering using ratatui. Styled after zfs-browser.
 */
 
-use crate::app::{ViewSnapshot, VisualRemoteKind, VisualRepo, VisualRepoDetail, VisualReport};
+use crate::app::{
+    ViewSnapshot, VisualRemoteKind, VisualRepo, VisualRepoDetail, VisualReport, matches_filter,
+};
+use crate::node::NodeKind;
+use crate::ui::state::UiState;
 use crate::usage::UsageListing;
 use crate::util::human_bytes;
 use crossterm::{
@@ -30,20 +34,21 @@ static HELP_TEXT: &str = r#"
   ↑ / k          up
   ↓ / j          down
   PgUp/PgDn      page
-  ⇧PgUp/PgDn     scroll details
-  g / G          top / bottom
+  g / G          top / bottom (also Home / End)
   → / Enter / l  descend
   ← / Back / h   back
+  Esc            close zoom / filter, else back (never quits)
+  ⇧PgUp/PgDn     scroll details (also J / K, Ctrl+d / Ctrl+u)
   r / F5         refresh (re-scan)
   /              filter current list
-  x              toggle raw / hex-ish view of selection
+  x              toggle raw view (locations, or TSV of a disk-usage dir)
   z              zoom visual to full screen
-  ? / F1         toggle help
-  q / Esc        quit
+  ? / F1         toggle help (any key closes it)
+  q              quit
 
 Focus on drives (special remotes), trust, last fsck, groups/wanted, numcopies, file locations per drive.
   Global report and per-repo visual: size bars + copy-health vs numcopies.
-  Enter on the report (or z) zooms it full screen; h/z back.
+  Enter on the report (or z) zooms it full screen; h/z/Esc back.
   Disk usage (inside a repo): ncdu-style listing, largest dirs/files first.
   Sizes come from git-annex keys, so dropped or missing content still counts.
   Remotes marked git annex dead are omitted from lists and totals.
@@ -83,28 +88,19 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Visible list rows for paging.
 pub fn page_size(term: &Terminal<CrosstermBackend<Stdout>>) -> usize {
     term.size()
         .map(|s| s.height.saturating_sub(LIST_CHROME_ROWS + 2) as usize)
         .unwrap_or(20)
+        .max(1)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn draw(
-    frame: &mut Frame,
-    snap: Option<&ViewSnapshot>,
-    busy: bool,
-    show_help: bool,
-    show_raw: bool,
-    detail_scroll: usize,
-    filter: &str,
-    filter_editing: bool,
-    zoom: bool,
-) {
+pub fn draw(frame: &mut Frame, ui: &UiState) {
     // Clear the screen on every frame to prevent old terminal content from showing through.
     frame.render_widget(Clear, frame.area());
 
-    let Some(snap) = snap else {
+    let Some(snap) = ui.snapshot.as_ref() else {
         let msg = Paragraph::new("scanning for annex repos…").block(
             Block::default()
                 .borders(Borders::ALL)
@@ -114,11 +110,11 @@ pub fn draw(
         return;
     };
 
-    if show_help {
+    if ui.show_help {
         let p = Paragraph::new(HELP_TEXT)
             .block(Block::default().borders(Borders::ALL).title(" help "))
             .wrap(Wrap { trim: true });
-        frame.render_widget(p, centered_rect(70, 22, frame.area()));
+        frame.render_widget(p, centered_rect(70, 26, frame.area()));
         return;
     }
 
@@ -131,9 +127,9 @@ pub fn draw(
 
     render_breadcrumb(frame, crumb_area, snap);
 
-    let zoomed = zoom && visual_for(snap) != VisualKind::None;
+    let zoomed = ui.zoom && visual_for(snap) != VisualKind::None;
     if zoomed {
-        render_details(frame, main_area, snap, detail_scroll, show_raw, true);
+        render_details(frame, main_area, snap, ui.detail_scroll, ui.show_raw, true);
     } else {
         let ncdu = snap.list.iter().any(|it| it.size.is_some());
         let [list_area, detail_area] = Layout::horizontal(if ncdu {
@@ -142,10 +138,17 @@ pub fn draw(
             [Constraint::Percentage(38), Constraint::Percentage(62)]
         })
         .areas(main_area);
-        render_list(frame, list_area, snap, filter);
-        render_details(frame, detail_area, snap, detail_scroll, show_raw, false);
+        render_list(frame, list_area, snap, &ui.filter);
+        render_details(
+            frame,
+            detail_area,
+            snap,
+            ui.detail_scroll,
+            ui.show_raw,
+            false,
+        );
     }
-    render_status(frame, status_area, snap, busy, filter, filter_editing, zoom);
+    render_status(frame, status_area, snap, ui);
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -169,17 +172,29 @@ fn render_breadcrumb(frame: &mut Frame, area: Rect, snap: &ViewSnapshot) {
     frame.render_widget(p, area);
 }
 
+fn kind_style(kind: NodeKind) -> Style {
+    match kind {
+        NodeKind::Drive => Style::default().fg(Color::Blue),
+        NodeKind::Here => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        NodeKind::Repo => Style::default().fg(Color::Magenta),
+        NodeKind::File => Style::default().fg(Color::Gray),
+        NodeKind::Usage | NodeKind::Report | NodeKind::Viz => Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+        NodeKind::Parent => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
+    }
+}
+
 fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str) {
     let f = filter.to_lowercase();
     let visible: Vec<(usize, &crate::app::ListItem)> = snap
         .list
         .iter()
         .enumerate()
-        .filter(|(_, it)| {
-            f.is_empty()
-                || it.label.to_lowercase().contains(&f)
-                || it.kind.to_lowercase().contains(&f)
-        })
+        .filter(|(_, it)| matches_filter(it, &f))
         .collect();
     let selected_vis = visible.iter().position(|(i, _)| *i == snap.selected);
     let ncdu = visible.iter().any(|(_, it)| it.size.is_some());
@@ -189,19 +204,6 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
     let items: Vec<RatListItem> = visible
         .iter()
         .map(|(i, it)| {
-            let kind_style = match it.kind.as_str() {
-                "drive" => Style::default().fg(Color::Blue),
-                "here" => Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-                "repo" => Style::default().fg(Color::Magenta),
-                "file" => Style::default().fg(Color::Gray),
-                "usage" | "report" | "viz" => Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                "parent" => Style::default().fg(Color::DarkGray),
-                _ => Style::default(),
-            };
             let sel_marker = if *i == snap.selected { "▶ " } else { "  " };
             let label_style = if it.anomalous {
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
@@ -220,7 +222,7 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
                     } else {
                         ((sz as f64 / size_total as f64) * bar_w as f64).round() as usize
                     };
-                    let bar_color = if it.kind == "dir" {
+                    let bar_color = if it.kind == NodeKind::Dir {
                         Color::Cyan
                     } else {
                         Color::Gray
@@ -244,11 +246,15 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
                 spans.push(Span::styled(&it.label, label_style));
                 RatListItem::new(Line::from(spans))
             } else {
-                RatListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(sel_marker),
-                    Span::styled(format!("[{}] ", it.kind), kind_style),
-                    Span::styled(&it.label, label_style),
-                ]))
+                    Span::styled(format!("[{}] ", it.kind), kind_style(it.kind)),
+                ];
+                if it.under_copies {
+                    spans.push(Span::styled("↓ ", Style::default().fg(Color::Red)));
+                }
+                spans.push(Span::styled(&it.label, label_style));
+                RatListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -264,11 +270,8 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn selected_kind(snap: &ViewSnapshot) -> &str {
-    snap.list
-        .get(snap.selected)
-        .map(|it| it.kind.as_str())
-        .unwrap_or("")
+fn selected_kind(snap: &ViewSnapshot) -> Option<NodeKind> {
+    snap.list.get(snap.selected).map(|it| it.kind)
 }
 
 fn selected_repo_visual(snap: &ViewSnapshot) -> Option<&VisualRepoDetail> {
@@ -278,9 +281,11 @@ fn selected_repo_visual(snap: &ViewSnapshot) -> Option<&VisualRepoDetail> {
 
 fn visual_for(snap: &ViewSnapshot) -> VisualKind {
     match selected_kind(snap) {
-        "report" if snap.visual.is_some() => VisualKind::Global,
-        "repo" | "viz" if selected_repo_visual(snap).is_some() => VisualKind::Repo,
-        "usage" | "dir" if snap.usage.is_some() => VisualKind::Usage,
+        Some(NodeKind::Report) if snap.visual.is_some() => VisualKind::Global,
+        Some(NodeKind::Repo | NodeKind::Viz) if selected_repo_visual(snap).is_some() => {
+            VisualKind::Repo
+        }
+        Some(NodeKind::Usage | NodeKind::Dir) if snap.usage.is_some() => VisualKind::Usage,
         _ => VisualKind::None,
     }
 }
@@ -347,31 +352,41 @@ fn render_details(
     frame.render_widget(p, area);
 }
 
-fn render_status(
-    frame: &mut Frame,
-    area: Rect,
-    snap: &ViewSnapshot,
-    busy: bool,
-    filter: &str,
-    filter_editing: bool,
-    zoom: bool,
-) {
-    let busy_str = if busy { " [busy]" } else { "" };
-    let filter_str = if filter_editing {
-        format!("  filter: {filter}_")
-    } else if !filter.is_empty() {
-        format!("  filter: {filter}")
-    } else {
-        String::new()
-    };
-    let text = format!(
-        "{}{}{}  •  {} repos  •  / filter  z zoom  ↑↓ nav  → descend  ← back  r refresh  q quit{}",
-        snap.status,
-        busy_str,
-        filter_str,
-        snap.total_repos,
-        if zoom { "  [zoomed]" } else { "" }
-    );
+/// Status first; key hints are dropped from the right when the line does not fit.
+fn status_line(snap: &ViewSnapshot, ui: &UiState, width: usize) -> String {
+    let mut head = snap.status.clone();
+    if ui.busy() {
+        head.push_str(" [busy]");
+    }
+    if ui.filter_editing {
+        head.push_str(&format!("  filter: {}_", ui.filter));
+    } else if !ui.filter.is_empty() {
+        head.push_str(&format!("  filter: {}", ui.filter));
+    }
+    if ui.zoom {
+        head.push_str("  [zoomed]");
+    }
+    let optional = [
+        format!("{} repos", snap.total_repos),
+        "? help".to_string(),
+        "q quit".to_string(),
+        "/ filter".to_string(),
+        "z zoom".to_string(),
+        "r refresh".to_string(),
+    ];
+    let mut line = head;
+    for part in optional {
+        let candidate = format!("{line}  •  {part}");
+        if candidate.chars().count() > width {
+            break;
+        }
+        line = candidate;
+    }
+    line
+}
+
+fn render_status(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, ui: &UiState) {
+    let text = status_line(snap, ui, area.width as usize);
     let p = Paragraph::new(text).style(Style::default().fg(Color::Gray));
     frame.render_widget(p, area);
 }

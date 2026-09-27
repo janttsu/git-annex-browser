@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,10 +16,11 @@ mod usage;
 mod util;
 mod worker;
 
-use app::{Command, ListItem, ViewSnapshot};
+use app::Command;
 use std::sync::atomic::Ordering;
-use ui::{keyboard::map_key, tui};
-use worker::{WorkerMsg, WorkerOut};
+use ui::state::{UiAction, UiState};
+use ui::tui;
+use worker::WorkerMsg;
 
 #[derive(Parser)]
 #[command(
@@ -74,13 +75,11 @@ fn run_scan(cfg: &Config, scan_root: &Path) -> Result<()> {
         let idx = i + 1;
 
         if !quiet {
-            let mut name = r
+            let name = r
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| r.display().to_string());
-            if name.len() > 40 {
-                name = format!("...{}", &name[name.len() - 37..]);
-            }
+            let name = util::truncate_start(&name, 40);
             let pct = (idx * 100).checked_div(total).unwrap_or(100);
             let bar_width = 30;
             let filled = (pct * bar_width) / 100;
@@ -248,266 +247,51 @@ fn main() -> Result<()> {
 
     let mut guard = tui::TerminalGuard::new()?;
     let tick = Duration::from_millis(cfg.tick_ms.clamp(10, 1000));
-    let mut snapshot: Option<ViewSnapshot> = None;
-    let mut pending: usize = 0;
-    let mut show_help = false;
-    let mut show_raw = false;
-    let mut detail_scroll: usize = 0;
-    let mut filter = String::new();
-    let mut filter_editing = false;
-    let mut zoom = false;
+    let mut ui = UiState::default();
+    let mut dirty = true;
 
     loop {
         while let Ok(msg) = snap_rx.try_recv() {
-            match msg {
-                WorkerOut::Nav(s) => {
-                    pending = pending.saturating_sub(1);
-                    let same = snapshot
-                        .as_ref()
-                        .map(|o| o.crumb == s.crumb && o.selected == s.selected)
-                        .unwrap_or(false);
-                    if !same {
-                        detail_scroll = 0;
-                    }
-                    snapshot = Some(s);
-                }
-                WorkerOut::Background(s) => {
-                    apply_background_snapshot(&mut snapshot, s, pending, &mut detail_scroll);
-                }
-            }
+            ui.on_worker(msg);
+            dirty = true;
         }
 
-        guard.term.draw(|frame| {
-            tui::draw(
-                frame,
-                snapshot.as_ref(),
-                pending > 0 || snapshot.as_ref().is_some_and(|s| s.scanning),
-                show_help,
-                show_raw,
-                detail_scroll,
-                &filter,
-                filter_editing,
-                zoom,
-            )
-        })?;
+        if dirty {
+            guard.term.draw(|frame| tui::draw(frame, &ui))?;
+            dirty = false;
+        }
 
         if !event::poll(tick)? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Resize(..) => {
+                dirty = true;
+                continue;
+            }
+            _ => continue,
         };
+        dirty = true;
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            request_quit(&cancel, &cmd_tx);
-            break;
-        }
-
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        if filter_editing {
-            match key.code {
-                KeyCode::Esc => {
-                    filter_editing = false;
-                    filter.clear();
-                }
-                KeyCode::Enter => filter_editing = false,
-                KeyCode::Backspace => {
-                    filter.pop();
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    filter.clear();
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    filter.push(c);
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        if key.code == KeyCode::Char('/') && !show_help {
-            filter_editing = true;
-            continue;
-        }
-
-        if key.code == KeyCode::Char('x') && !show_help {
-            show_raw = !show_raw;
-            continue;
-        }
-
-        if key.code == KeyCode::Char('z') && !show_help {
-            zoom = !zoom;
-            continue;
-        }
-
-        if key.modifiers.contains(KeyModifiers::SHIFT)
-            && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
-        {
-            let page = tui::page_size(&guard.term).max(1);
-            let rows = snapshot.as_ref().map(tui::detail_scroll_rows).unwrap_or(0);
-            let max = rows.saturating_sub(page);
-            detail_scroll = match key.code {
-                KeyCode::PageDown => (detail_scroll + page).min(max),
-                _ => detail_scroll.saturating_sub(page),
-            };
-            continue;
-        }
-
-        let cmd = map_key(key);
-        match cmd {
-            Command::Quit if zoom => {
-                zoom = false;
-            }
-            Command::Quit => {
+        let page = tui::page_size(&guard.term);
+        match ui.handle_key(key, page) {
+            UiAction::None => {}
+            UiAction::Quit => {
                 request_quit(&cancel, &cmd_tx);
                 break;
             }
-            Command::ToggleHelp => show_help = !show_help,
-            Command::None => (),
-            _ if show_help => {
-                show_help = false;
-            }
-            Command::Up
-            | Command::Down
-            | Command::PageUp
-            | Command::PageDown
-            | Command::Top
-            | Command::Bottom => {
-                if let Some(s) = &mut snapshot {
-                    apply_nav(s, cmd, tui::page_size(&guard.term).max(1), &filter);
-                }
-                let send = if filter.is_empty() {
-                    cmd
-                } else {
-                    Command::Select(snapshot.as_ref().map(|s| s.selected).unwrap_or(0))
-                };
-                let page = tui::page_size(&guard.term);
-                if cmd_tx.send(WorkerMsg::Nav(send, page)).is_err() {
-                    break;
-                }
-                pending += 1;
-            }
-            Command::Back if zoom => {
-                zoom = false;
-            }
-            Command::Descend | Command::Back | Command::Refresh => {
-                let kind = snapshot
-                    .as_ref()
-                    .and_then(|s| s.list.get(s.selected))
-                    .map(|i| i.kind.as_str());
-                if cmd == Command::Descend && matches!(kind, Some("report") | Some("viz")) {
-                    zoom = true;
-                    continue;
-                }
-                if matches!(cmd, Command::Descend | Command::Back | Command::Refresh) {
-                    filter.clear();
-                    filter_editing = false;
-                }
-                if cmd == Command::Refresh {
-                    zoom = false;
-                }
-                let page = tui::page_size(&guard.term);
+            UiAction::Send(cmd) => {
                 if cmd_tx.send(WorkerMsg::Nav(cmd, page)).is_err() {
                     break;
                 }
-                pending += 1;
-            }
-            cmd => {
-                let page = tui::page_size(&guard.term);
-                if cmd_tx.send(WorkerMsg::Nav(cmd, page)).is_err() {
-                    break;
-                }
-                pending += 1;
             }
         }
     }
     Ok(())
 }
 
-fn apply_background_snapshot(
-    snapshot: &mut Option<ViewSnapshot>,
-    incoming: ViewSnapshot,
-    pending: usize,
-    detail_scroll: &mut usize,
-) {
-    if pending > 0
-        && let Some(cur) = snapshot.as_mut()
-    {
-        if cur.crumb == incoming.crumb {
-            let sel = cur.selected.min(incoming.list.len().saturating_sub(1));
-            let selected_matches = sel == incoming.selected;
-            cur.list = incoming.list;
-            cur.status = incoming.status;
-            cur.total_repos = incoming.total_repos;
-            cur.scanning = incoming.scanning;
-            cur.visual = incoming.visual;
-            cur.repo_visuals = incoming.repo_visuals;
-            cur.details = if selected_matches {
-                incoming.details
-            } else {
-                cur.details.clone()
-            };
-            cur.raw = if selected_matches {
-                incoming.raw
-            } else {
-                cur.raw.clone()
-            };
-            cur.usage = if selected_matches {
-                incoming.usage
-            } else {
-                cur.usage.clone()
-            };
-            cur.selected = sel;
-        }
-        return;
-    }
-    let same = snapshot
-        .as_ref()
-        .map(|o| o.crumb == incoming.crumb && o.selected == incoming.selected)
-        .unwrap_or(false);
-    if !same {
-        *detail_scroll = 0;
-    }
-    *snapshot = Some(incoming);
-}
-
 fn request_quit(cancel: &Arc<AtomicBool>, cmd_tx: &std::sync::mpsc::Sender<WorkerMsg>) {
     cancel.store(true, Ordering::Relaxed);
     let _ = cmd_tx.send(WorkerMsg::Nav(Command::Quit, 0));
-}
-
-fn visible_indices(list: &[ListItem], filter: &str) -> Vec<usize> {
-    if filter.is_empty() {
-        return (0..list.len()).collect();
-    }
-    let f = filter.to_lowercase();
-    list.iter()
-        .enumerate()
-        .filter(|(_, it)| {
-            it.label.to_lowercase().contains(&f) || it.kind.to_lowercase().contains(&f)
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-fn apply_nav(s: &mut ViewSnapshot, cmd: Command, page_size: usize, filter: &str) {
-    let vis = visible_indices(&s.list, filter);
-    if vis.is_empty() {
-        return;
-    }
-    let cur = vis.iter().position(|&i| i == s.selected).unwrap_or(0);
-    let last = vis.len().saturating_sub(1);
-    let next = match cmd {
-        Command::Up => cur.saturating_sub(1),
-        Command::Down => (cur + 1).min(last),
-        Command::PageUp => cur.saturating_sub(page_size),
-        Command::PageDown => (cur + page_size).min(last),
-        Command::Top => 0,
-        Command::Bottom => last,
-        _ => cur,
-    };
-    s.selected = vis[next];
 }

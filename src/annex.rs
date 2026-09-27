@@ -757,19 +757,21 @@ fn parse_location_log_line(line: &str) -> Option<(String, i64, bool)> {
 }
 
 /// Presence map from git-annex branch location logs (includes untrusted remotes).
-fn load_locations_from_branch(root: &Path) -> HashMap<String, HashSet<String>> {
-    let Ok(out) = Command::new("git")
+fn load_locations_from_branch(root: &Path) -> Result<HashMap<String, HashSet<String>>> {
+    let out = Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["ls-tree", "-r", "-z", "git-annex"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
-    else {
-        return HashMap::new();
-    };
+        .with_context(|| format!("{}: running git ls-tree", root.display()))?;
     if !out.status.success() {
-        return HashMap::new();
+        anyhow::bail!(
+            "{}: git ls-tree git-annex failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
 
     let mut shas = Vec::new();
@@ -797,10 +799,10 @@ fn load_locations_from_branch(root: &Path) -> HashMap<String, HashSet<String>> {
         keys.push(key.to_string());
     }
     if shas.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
 
-    cat_file_location_logs(root, shas, keys)
+    Ok(cat_file_location_logs(root, shas, keys))
 }
 
 /// `git cat-file --batch` the location-log blobs. A writer thread avoids
@@ -1237,11 +1239,18 @@ pub fn load_annexed_files(root: &Path) -> Vec<AnnexedFile> {
 pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let root = repo.to_path_buf();
 
-    // Basic config
+    // Basic config. A missing uuid means git failed or the annex is not initialised;
+    // returning empty metadata would overwrite a good cache entry with zeros.
     let uuid = run_git(&root, &["config", "--get", "annex.uuid"])
-        .unwrap_or_default()
+        .with_context(|| format!("{}: reading annex.uuid", root.display()))?
         .trim()
         .to_string();
+    if uuid.is_empty() {
+        anyhow::bail!(
+            "{}: annex.uuid is empty — not an initialised annex?",
+            root.display()
+        );
+    }
     let desc = run_git(&root, &["config", "--get", "annex.describe"])
         .unwrap_or_default()
         .trim()
@@ -1408,7 +1417,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     // Presence from git-annex branch location logs (includes untrusted remotes
     // such as Glacier). `whereis --json --all` is too slow on large annexes and
     // left used-storage figures stale after `copy --to` Glacier.
-    let mut locations = load_locations_from_branch(&root);
+    let mut locations = load_locations_from_branch(&root)?;
     drop_dead_remotes(&uuid, &mut remotes, &mut locations);
 
     let total_keys = locations.len().max(files.len());
