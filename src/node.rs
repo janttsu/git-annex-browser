@@ -423,6 +423,21 @@ impl Node for RepoNode {
                     meta: Arc::clone(meta),
                 }),
             ];
+            let at_risk = meta.at_risk_files().len();
+            if at_risk > 0 {
+                kids.push(Rc::new(AtRiskNode {
+                    meta: Arc::clone(meta),
+                    count: at_risk,
+                    children: OnceCell::new(),
+                }));
+            }
+            let plan = meta.fetch_plan();
+            if plan.missing_keys > 0 {
+                kids.push(Rc::new(FetchPlanNode {
+                    meta: Arc::clone(meta),
+                    plan,
+                }));
+            }
             if !meta.files.is_empty() {
                 kids.push(Rc::new(FileTreeNode::all_files(Arc::clone(meta))));
             }
@@ -526,6 +541,112 @@ fn push_remote_prefs(rows: &mut Vec<String>, r: &Remote) {
     }
     if let Some(req) = &r.required {
         rows.push(format!("required: {}", req));
+    }
+}
+
+/// Files with fewer counting copies than numcopies (untrusted copies such as Glacier do not count).
+pub struct AtRiskNode {
+    meta: Arc<AnnexMetadata>,
+    count: usize,
+    children: OnceCell<Children>,
+}
+
+impl Node for AtRiskNode {
+    fn label(&self) -> String {
+        format!(
+            "at risk: {} files under numcopies {}",
+            self.count,
+            self.meta.wanted_copies()
+        )
+    }
+    fn kind(&self) -> NodeKind {
+        NodeKind::Files
+    }
+    fn under_copies(&self) -> bool {
+        true
+    }
+    fn children(&self) -> Children {
+        cached(&self.children, || {
+            self.meta
+                .at_risk_files()
+                .into_iter()
+                .map(|(f, _)| {
+                    Rc::new(AnnexFileNode {
+                        meta: Arc::clone(&self.meta),
+                        file: f.clone(),
+                        highlight_drive: None,
+                    }) as Rc<dyn Node>
+                })
+                .collect()
+        })
+    }
+    fn details(&self) -> Vec<String> {
+        let risk = self.meta.at_risk_files();
+        let bytes: u64 = risk.iter().filter_map(|(f, _)| f.size).sum();
+        let none = risk.iter().filter(|(_, n)| *n == 0).count();
+        vec![
+            format!(
+                "{} working-tree files have fewer than {} counting copies ({}).",
+                risk.len(),
+                self.meta.wanted_copies(),
+                human_bytes(bytes)
+            ),
+            format!("{none} of them have no trusted or semitrusted copy at all."),
+            "Copies on untrusted remotes (e.g. Glacier) and dead remotes do not count,".into(),
+            "matching how git-annex applies numcopies. Fewest copies first.".into(),
+        ]
+    }
+}
+
+/// Which drives to connect to get every file that is not present here.
+pub struct FetchPlanNode {
+    meta: Arc<AnnexMetadata>,
+    plan: crate::annex::FetchPlan,
+}
+
+impl Node for FetchPlanNode {
+    fn label(&self) -> String {
+        format!(
+            "missing here: {} files ({}) — drives to connect",
+            self.plan.missing_keys,
+            human_bytes(self.plan.missing_bytes)
+        )
+    }
+    fn kind(&self) -> NodeKind {
+        NodeKind::Info
+    }
+    fn details(&self) -> Vec<String> {
+        let p = &self.plan;
+        let mut d = vec![
+            format!(
+                "{} files ({}) in the working tree have no content here.",
+                p.missing_keys,
+                human_bytes(p.missing_bytes)
+            ),
+            "Connect these drives, in order, to `git annex get` all of them:".into(),
+            String::new(),
+        ];
+        for (i, (uuid, keys, bytes)) in p.steps.iter().enumerate() {
+            let trust = self.meta.remotes.get(uuid).map_or('?', |r| r.trust.short());
+            d.push(format!(
+                "  {}. {} {}  +{} files, {}",
+                i + 1,
+                crate::annex::short_name(&self.meta, uuid),
+                trust,
+                keys,
+                human_bytes(*bytes)
+            ));
+        }
+        if p.unavailable_keys > 0 {
+            d.push(String::new());
+            d.push(format!(
+                "{} files have no recorded copy on any known remote.",
+                p.unavailable_keys
+            ));
+        }
+        d.push(String::new());
+        d.push("Local drives come first, then special remotes (cloud), untrusted last.".into());
+        d
     }
 }
 

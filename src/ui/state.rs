@@ -2,9 +2,11 @@
 
 use crate::app::{Command, ViewSnapshot, visible_indices};
 use crate::ui::keyboard::map_key;
-use crate::ui::tui;
+use crate::ui::tui::{self, DrawInfo};
 use crate::worker::WorkerOut;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 /// What the main loop should do after a key press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +232,61 @@ impl UiState {
         UiAction::Send(cmd)
     }
 
+    /// Wheel over the list moves the selection, elsewhere it scrolls details.
+    /// A click selects a row; clicking the selected row opens it.
+    pub fn handle_mouse(&mut self, ev: MouseEvent, info: &DrawInfo, page: usize) -> UiAction {
+        if self.show_help {
+            if matches!(ev.kind, MouseEventKind::Down(_)) {
+                self.show_help = false;
+            }
+            return UiAction::None;
+        }
+        let over_list = info.list_area.is_some_and(|a| {
+            ev.column >= a.x
+                && ev.column < a.x + a.width
+                && ev.row >= a.y
+                && ev.row < a.y + a.height
+        });
+        match ev.kind {
+            MouseEventKind::ScrollDown if over_list => self.nav_move(Command::Down, page),
+            MouseEventKind::ScrollUp if over_list => self.nav_move(Command::Up, page),
+            MouseEventKind::ScrollDown => {
+                self.scroll_details(true, 3);
+                UiAction::None
+            }
+            MouseEventKind::ScrollUp => {
+                self.scroll_details(false, 3);
+                UiAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) if over_list => {
+                let area = info.list_area.expect("over_list implies area");
+                // Border rows are not list rows.
+                if ev.row <= area.y || ev.row + 1 >= area.y + area.height {
+                    return UiAction::None;
+                }
+                let row = info.list_offset + usize::from(ev.row - area.y - 1);
+                self.click_row(row)
+            }
+            _ => UiAction::None,
+        }
+    }
+
+    fn click_row(&mut self, row: usize) -> UiAction {
+        let Some(s) = self.snapshot.as_mut() else {
+            return UiAction::None;
+        };
+        let vis = visible_indices(&s.list, &self.filter);
+        let Some(&idx) = vis.get(row) else {
+            return UiAction::None;
+        };
+        if idx == s.selected {
+            return self.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), 1);
+        }
+        s.selected = idx;
+        self.detail_scroll = 0;
+        self.send(Command::Select(idx))
+    }
+
     pub fn scroll_details(&mut self, down: bool, by: usize) {
         let by = by.max(1);
         if down {
@@ -395,6 +452,45 @@ mod tests {
         let s = ui.snapshot.as_ref().unwrap();
         assert_eq!(s.crumb, vec!["root".to_string()]);
         assert_eq!(s.status, "cache updated");
+    }
+
+    fn click(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn click_selects_then_opens_and_wheel_moves() {
+        let mut ui = state();
+        let info = DrawInfo {
+            list_area: Some(ratatui::layout::Rect::new(0, 1, 30, 10)),
+            list_offset: 0,
+        };
+        // Row 1 is the top border; rows 2.. are items 0..
+        let left = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(ui.handle_mouse(click(left, 5, 1), &info, 5), UiAction::None);
+        assert_eq!(
+            ui.handle_mouse(click(left, 5, 4), &info, 5),
+            UiAction::Send(Command::Select(2))
+        );
+        assert_eq!(
+            ui.handle_mouse(click(left, 5, 4), &info, 5),
+            UiAction::Send(Command::Descend)
+        );
+        assert_eq!(
+            ui.handle_mouse(click(MouseEventKind::ScrollUp, 5, 5), &info, 5),
+            UiAction::Send(Command::Up)
+        );
+        assert_eq!(ui.snapshot.as_ref().unwrap().selected, 1);
+        // Outside the list the wheel scrolls details and sends nothing.
+        assert_eq!(
+            ui.handle_mouse(click(MouseEventKind::ScrollDown, 50, 5), &info, 5),
+            UiAction::None
+        );
     }
 
     #[test]
