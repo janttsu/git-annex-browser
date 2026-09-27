@@ -265,33 +265,7 @@ impl App {
         if self.summaries.is_empty() {
             self.summaries = repos
                 .iter()
-                .map(|p| {
-                    let name = p
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    let mut s = RepoSummary {
-                        root: p.clone(),
-                        uuid: String::new(),
-                        name,
-                        annex_description: String::new(),
-                        file_count: 0,
-                        remote_count: 0,
-                        here_present_count: 0,
-                        here_available_space: None,
-                        unique_size: 0,
-                        consumed_size: 0,
-                        remote_usage: vec![],
-                        numcopies: None,
-                        keys_tracked: 0,
-                        keys_under: 0,
-                        keys_ok: 0,
-                        keys_over: 0,
-                    };
-                    s.ensure_name();
-                    s
-                })
+                .map(|p| RepoSummary::placeholder(p.clone()))
                 .collect();
         }
         self.refresh_root_view();

@@ -209,12 +209,8 @@ fn main() -> Result<()> {
                     .last_fsck
                     .map(|t| format!(" fsck={}", util::fmt_unix(t)))
                     .unwrap_or_default();
-                let sp = rem
-                    .available_space
-                    .map(|b| format!(" {} free", util::human_bytes(b)))
-                    .unwrap_or_default();
                 println!(
-                    "    - {} ({}){} trust={} present={} keys{}{}{}",
+                    "    - {} ({}){} trust={} present={} keys{}{}",
                     rem.name(),
                     rem.rtype(),
                     marker,
@@ -226,7 +222,6 @@ fn main() -> Result<()> {
                         String::new()
                     },
                     fs,
-                    sp
                 );
             }
             println!();
