@@ -303,7 +303,7 @@ impl UsageFileNode {
         self.meta
             .locations
             .get(&self.file.key)
-            .map(|s| s.contains(&self.meta.uuid))
+            .map(|s| s.contains(self.meta.uuid.as_str()))
             .unwrap_or(false)
     }
 }
@@ -343,7 +343,7 @@ mod tests {
     fn f(path: &str, size: u64) -> AnnexedFile {
         AnnexedFile {
             path: path.into(),
-            key: format!("SHA256E-s{size}--{path}"),
+            key: format!("SHA256E-s{size}--{path}").into(),
             size: Some(size),
         }
     }
