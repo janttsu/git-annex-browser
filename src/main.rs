@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,15 +187,19 @@ fn run_scan(cfg: &Config, cache: &Cache, scan_root: &Path) -> Result<()> {
 
 fn run_dump(cfg: &Config, cache: &Cache, scan_root: &Path) -> Result<()> {
     let loaded = refresh_cache(cfg, cache, scan_root, !cfg.quiet && !cfg.json)?;
-    if cfg.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&dump_json(scan_root, &loaded))?
-        );
+    let mut w = std::io::BufWriter::new(std::io::stdout().lock());
+    let written = if cfg.json {
+        serde_json::to_writer_pretty(&mut w, &dump_json(scan_root, &loaded))
+            .map_err(io::Error::from)
+            .and_then(|()| writeln!(w))
     } else {
-        print_dump(scan_root, &loaded);
+        print_dump(&mut w, scan_root, &loaded)
+    };
+    match written.and_then(|()| w.flush()) {
+        // `--dump | head` closes the pipe early; that is not an error.
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
     }
-    Ok(())
 }
 
 fn dump_json(scan_root: &Path, loaded: &[AnnexMetadata]) -> serde_json::Value {
@@ -250,38 +255,41 @@ fn dump_json(scan_root: &Path, loaded: &[AnnexMetadata]) -> serde_json::Value {
     })
 }
 
-fn print_dump(scan_root: &Path, loaded: &[AnnexMetadata]) {
-    println!("git-annex-browser dump for {}", scan_root.display());
-    println!("found {} annex repos\n", loaded.len());
+fn print_dump(w: &mut impl Write, scan_root: &Path, loaded: &[AnnexMetadata]) -> io::Result<()> {
+    writeln!(w, "git-annex-browser dump for {}", scan_root.display())?;
+    writeln!(w, "found {} annex repos\n", loaded.len())?;
 
     let total_unique: u64 = loaded.iter().map(|m| m.unique_size).sum();
     let total_consumed: u64 = loaded.iter().map(|m| m.consumed_size).sum();
     let total_files: usize = loaded.iter().map(|m| m.files.len()).sum();
-    println!("REPORT:");
-    println!(
+    writeln!(w, "REPORT:")?;
+    writeln!(
+        w,
         "  total unique data (1 copy per file): {}",
         util::human_bytes(total_unique)
-    );
-    println!(
+    )?;
+    writeln!(
+        w,
         "  total storage across all drives (with copies): {}",
         util::human_bytes(total_consumed)
-    );
-    println!("  total working tree files: {}", total_files);
+    )?;
+    writeln!(w, "  total working tree files: {}", total_files)?;
     let summaries: Vec<_> = loaded.iter().map(|m| m.to_summary()).collect();
     let per_remote = annex::aggregate_remote_usage(&summaries);
     if !per_remote.is_empty() {
-        println!("  storage per special remote (rclone etc.):");
+        writeln!(w, "  storage per special remote (rclone etc.):")?;
         for (name, bytes, keys, repos) in per_remote {
-            println!(
+            writeln!(
+                w,
                 "    - {} : {} ({} keys, {} repos)",
                 name,
                 util::human_bytes(bytes),
                 keys,
                 repos
-            );
+            )?;
         }
     }
-    println!();
+    writeln!(w)?;
 
     for m in loaded {
         let r = &m.root;
@@ -294,19 +302,26 @@ fn print_dump(scan_root: &Path, loaded: &[AnnexMetadata]) {
         } else {
             String::new()
         };
-        println!("=== {}{} ===", clean, desc_note);
-        println!("  path: {}", r.display());
-        println!("  uuid: {}", m.uuid);
-        println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
-        println!(
+        writeln!(w, "=== {}{} ===", clean, desc_note)?;
+        writeln!(w, "  path: {}", r.display())?;
+        writeln!(w, "  uuid: {}", m.uuid)?;
+        writeln!(
+            w,
+            "  files in tree: {}, keys: {}",
+            m.files.len(),
+            m.total_keys
+        )?;
+        writeln!(
+            w,
             "  unique size (1 copy): {}",
             util::human_bytes(m.unique_size)
-        );
-        println!(
+        )?;
+        writeln!(
+            w,
             "  consumed across drives: {}",
             util::human_bytes(m.consumed_size)
-        );
-        println!("  remotes/drives:");
+        )?;
+        writeln!(w, "  remotes/drives:")?;
         let mut rems: Vec<_> = m.remotes.values().collect();
         rems.sort_by_key(|r| (std::cmp::Reverse(r.last_fsck.unwrap_or(0)), r.name()));
         for rem in rems {
@@ -320,7 +335,8 @@ fn print_dump(scan_root: &Path, loaded: &[AnnexMetadata]) {
             } else {
                 String::new()
             };
-            println!(
+            writeln!(
+                w,
                 "    - {} ({}){} trust={} present={} keys{}{}",
                 rem.name(),
                 rem.rtype(),
@@ -329,10 +345,11 @@ fn print_dump(scan_root: &Path, loaded: &[AnnexMetadata]) {
                 rem.present_count,
                 size,
                 fs,
-            );
+            )?;
         }
-        println!();
+        writeln!(w)?;
     }
+    Ok(())
 }
 
 fn main() -> Result<()> {
