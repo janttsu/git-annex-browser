@@ -5,22 +5,27 @@ use clap::Parser;
 use crossterm::event::{self, Event};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod annex;
 mod app;
+mod cache;
 mod node;
+mod scan;
+#[cfg(test)]
+mod testutil;
 mod ui;
 mod usage;
 mod util;
 mod worker;
 
+use annex::AnnexMetadata;
 use app::Command;
-use std::sync::atomic::Ordering;
+use cache::Cache;
 use ui::state::{UiAction, UiState};
 use ui::tui;
-use worker::WorkerMsg;
+use worker::{WorkerConfig, WorkerMsg};
 
 #[derive(Parser)]
 #[command(
@@ -36,14 +41,15 @@ struct Config {
     #[arg(long, default_value_t = 100)]
     tick_ms: u64,
 
-    /// Dump textual summary (no TUI) — useful for scripting or quick inspection
+    /// Print a text summary (no TUI) — useful for scripting or quick inspection.
     #[arg(long)]
     dump: bool,
 
-    /// Scan repos and update the local cache (no TUI/GUI).
-    /// The tool's main value is caching git-annex metadata so that viewing
-    /// the overall state of many repositories and drives is fast and clear
-    /// in the interactive interface, instead of running slow commands repeatedly.
+    /// With --dump, print JSON instead of text.
+    #[arg(long, requires = "dump")]
+    json: bool,
+
+    /// Scan repos and update the local cache (no TUI). Unchanged repos are skipped.
     #[arg(long)]
     scan: bool,
 
@@ -58,6 +64,27 @@ struct Config {
     /// Do not descend into other mounted filesystems while looking for annexes.
     #[arg(long)]
     one_file_system: bool,
+
+    /// Cache directory (default: $GIT_ANNEX_BROWSER_CACHE or ~/.cache/git-annex-browser).
+    #[arg(long, value_name = "DIR")]
+    cache: Option<PathBuf>,
+
+    /// Show only cached data; do not read the repos (slow network or unplugged drives).
+    #[arg(long, conflicts_with_all = ["scan", "dump"])]
+    offline: bool,
+
+    /// Reload every repo even if its git-annex branch and HEAD are unchanged.
+    #[arg(long)]
+    force_rescan: bool,
+
+    /// With --scan or --dump, delete cached repos under DIR that were not found.
+    /// Without it they are kept and shown as "not found since …".
+    #[arg(long)]
+    prune: bool,
+
+    /// Repos to load in parallel.
+    #[arg(long, value_name = "N", default_value_t = scan::default_jobs())]
+    jobs: usize,
 }
 
 impl Config {
@@ -69,72 +96,243 @@ impl Config {
     }
 }
 
-fn run_scan(cfg: &Config, scan_root: &Path) -> Result<()> {
-    let quiet = cfg.quiet;
+fn progress_line(done: usize, total: usize, path: &Path) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let name = util::truncate_start(&name, 40);
+    let pct = (done * 100).checked_div(total).unwrap_or(100);
+    let bar_width = 30;
+    let filled = (pct * bar_width) / 100;
+    let bar = "=".repeat(filled) + &" ".repeat(bar_width - filled);
+    eprint!("\r\x1b[K[{bar}] {done}/{total} ({pct}%) {name}");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
 
-    if !quiet {
+/// Discover repos under `scan_root`, reload changed ones into the cache and return
+/// metadata for every repo found (from the cache when unchanged).
+fn refresh_cache(
+    cfg: &Config,
+    cache: &Cache,
+    scan_root: &Path,
+    verbose: bool,
+) -> Result<Vec<AnnexMetadata>> {
+    if verbose {
         eprintln!(
             "Scanning for git-annex repos under {} ...",
             scan_root.display()
         );
     }
-
-    let repos = annex::find_annex_repos(scan_root, &cfg.discover_options());
-
-    if !quiet {
-        eprintln!("Found {} repos", repos.len());
+    let index = cache.load_index();
+    let found = scan::discover(scan_root, &cfg.discover_options());
+    let todo = scan::needs_load(&found, &index, cfg.force_rescan);
+    if verbose {
+        eprintln!("Found {} repos, {} new or changed", found.len(), todo.len());
     }
 
-    let mut found = std::collections::HashMap::new();
-
-    let total = repos.len();
-    for (i, r) in repos.iter().enumerate() {
-        let idx = i + 1;
-
-        if !quiet {
-            let name = r
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.display().to_string());
-            let name = util::truncate_start(&name, 40);
-            let pct = (idx * 100).checked_div(total).unwrap_or(100);
-            let bar_width = 30;
-            let filled = (pct * bar_width) / 100;
-            let bar = "=".repeat(filled) + &" ".repeat(bar_width - filled);
-            eprint!("\r[{}] {}/{} ({}%) {}", bar, idx, total, pct, name);
-            let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut loaded: Vec<AnnexMetadata> = Vec::new();
+    let mut failures = 0usize;
+    scan::load_parallel(&todo, cfg.jobs, |n, p, res| {
+        if verbose {
+            progress_line(n, todo.len(), p);
         }
-
-        match annex::load_metadata(r) {
-            Ok(m) => {
-                found.insert(r.to_string_lossy().to_string(), m);
+        match res {
+            Ok(meta) => {
+                if let Err(e) = cache.store_repo(&meta) {
+                    failures += 1;
+                    eprintln!("\n  Warning: could not cache {}: {e:#}", p.display());
+                }
+                loaded.push(meta);
             }
             Err(e) => {
-                if !quiet {
-                    eprintln!("\n  Warning: failed to load {}: {}", r.display(), e);
-                }
+                failures += 1;
+                eprintln!("\n  Warning: failed to load {}: {e:#}", p.display());
             }
         }
+    });
+    if verbose && !todo.is_empty() {
+        eprintln!();
     }
 
-    if !quiet {
-        eprintln!(); // finish the progress line
-    }
+    let paths: Vec<PathBuf> = found.iter().map(|f| f.path.clone()).collect();
+    cache.mark_scan(scan_root, &paths, cfg.prune)?;
 
-    if let Err(e) = annex::merge_scan_into_cache(scan_root, found) {
-        if !quiet {
-            eprintln!("Failed to save cache: {}", e);
+    // Unchanged repos come from the cache.
+    let index = cache.load_index();
+    for f in &found {
+        if loaded.iter().any(|m| m.root == f.path) {
+            continue;
         }
-        return Err(e);
+        if let Some(meta) = index.get(&f.path).and_then(|e| cache.load_repo(e)) {
+            loaded.push(meta);
+        }
     }
-
-    if !quiet {
-        let p = annex::cache_path();
-        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        eprintln!("Cache updated: {} ({} bytes)", p.display(), size);
+    loaded.sort_by(|a, b| a.root.cmp(&b.root));
+    if failures > 0 {
+        anyhow::bail!("{failures} repo(s) could not be loaded or cached");
     }
+    Ok(loaded)
+}
 
+fn run_scan(cfg: &Config, cache: &Cache, scan_root: &Path) -> Result<()> {
+    let verbose = !cfg.quiet;
+    refresh_cache(cfg, cache, scan_root, verbose)?;
+    if verbose {
+        eprintln!("Cache updated: {}", cache.dir().display());
+    }
     Ok(())
+}
+
+fn run_dump(cfg: &Config, cache: &Cache, scan_root: &Path) -> Result<()> {
+    let loaded = refresh_cache(cfg, cache, scan_root, !cfg.quiet && !cfg.json)?;
+    if cfg.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&dump_json(scan_root, &loaded))?
+        );
+    } else {
+        print_dump(scan_root, &loaded);
+    }
+    Ok(())
+}
+
+fn dump_json(scan_root: &Path, loaded: &[AnnexMetadata]) -> serde_json::Value {
+    use serde_json::json;
+    let summaries: Vec<_> = loaded.iter().map(|m| m.to_summary()).collect();
+    let repos: Vec<_> = loaded
+        .iter()
+        .zip(&summaries)
+        .map(|(m, s)| {
+            let mut remotes: Vec<_> = m.remotes.values().collect();
+            remotes.sort_by(|a, b| a.name().cmp(b.name()));
+            json!({
+                "path": m.root,
+                "name": s.name,
+                "uuid": m.uuid,
+                "description": m.description,
+                "files": m.files.len(),
+                "keys": m.total_keys,
+                "unique_size": m.unique_size,
+                "consumed_size": m.consumed_size,
+                "numcopies": m.numcopies,
+                "keys_under_numcopies": s.keys_under,
+                "keys_at_numcopies": s.keys_ok,
+                "keys_over_numcopies": s.keys_over,
+                "remotes": remotes.iter().map(|r| json!({
+                    "name": r.name(),
+                    "uuid": r.uuid,
+                    "type": r.rtype(),
+                    "here": r.uuid == m.uuid,
+                    "trust": r.trust.as_str(),
+                    "present_keys": r.present_count,
+                    "present_size": r.present_size,
+                    "last_fsck": r.last_fsck,
+                    "groups": r.groups,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let special: Vec<_> = annex::aggregate_remote_usage(&summaries)
+        .into_iter()
+        .map(|(name, bytes, keys, repos)| json!({"name": name, "bytes": bytes, "keys": keys, "repos": repos}))
+        .collect();
+    json!({
+        "root": scan_root,
+        "totals": {
+            "repos": loaded.len(),
+            "unique_size": loaded.iter().map(|m| m.unique_size).sum::<u64>(),
+            "consumed_size": loaded.iter().map(|m| m.consumed_size).sum::<u64>(),
+            "files": loaded.iter().map(|m| m.files.len()).sum::<usize>(),
+        },
+        "special_remotes": special,
+        "repos": repos,
+    })
+}
+
+fn print_dump(scan_root: &Path, loaded: &[AnnexMetadata]) {
+    println!("git-annex-browser dump for {}", scan_root.display());
+    println!("found {} annex repos\n", loaded.len());
+
+    let total_unique: u64 = loaded.iter().map(|m| m.unique_size).sum();
+    let total_consumed: u64 = loaded.iter().map(|m| m.consumed_size).sum();
+    let total_files: usize = loaded.iter().map(|m| m.files.len()).sum();
+    println!("REPORT:");
+    println!(
+        "  total unique data (1 copy per file): {}",
+        util::human_bytes(total_unique)
+    );
+    println!(
+        "  total storage across all drives (with copies): {}",
+        util::human_bytes(total_consumed)
+    );
+    println!("  total working tree files: {}", total_files);
+    let summaries: Vec<_> = loaded.iter().map(|m| m.to_summary()).collect();
+    let per_remote = annex::aggregate_remote_usage(&summaries);
+    if !per_remote.is_empty() {
+        println!("  storage per special remote (rclone etc.):");
+        for (name, bytes, keys, repos) in per_remote {
+            println!(
+                "    - {} : {} ({} keys, {} repos)",
+                name,
+                util::human_bytes(bytes),
+                keys,
+                repos
+            );
+        }
+    }
+    println!();
+
+    for m in loaded {
+        let r = &m.root;
+        let clean = r
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| r.display().to_string());
+        let desc_note = if !m.description.is_empty() && m.description != clean {
+            format!(" ({})", m.description)
+        } else {
+            String::new()
+        };
+        println!("=== {}{} ===", clean, desc_note);
+        println!("  path: {}", r.display());
+        println!("  uuid: {}", m.uuid);
+        println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
+        println!(
+            "  unique size (1 copy): {}",
+            util::human_bytes(m.unique_size)
+        );
+        println!(
+            "  consumed across drives: {}",
+            util::human_bytes(m.consumed_size)
+        );
+        println!("  remotes/drives:");
+        let mut rems: Vec<_> = m.remotes.values().collect();
+        rems.sort_by_key(|r| (std::cmp::Reverse(r.last_fsck.unwrap_or(0)), r.name()));
+        for rem in rems {
+            let marker = if rem.uuid == m.uuid { " [HERE]" } else { "" };
+            let fs = rem
+                .last_fsck
+                .map(|t| format!(" fsck={}", util::fmt_unix(t)))
+                .unwrap_or_default();
+            let size = if rem.present_size > 0 {
+                format!(" {}", util::human_bytes(rem.present_size))
+            } else {
+                String::new()
+            };
+            println!(
+                "    - {} ({}){} trust={} present={} keys{}{}",
+                rem.name(),
+                rem.rtype(),
+                marker,
+                rem.trust.as_str(),
+                rem.present_count,
+                size,
+                fs,
+            );
+        }
+        println!();
+    }
 }
 
 fn main() -> Result<()> {
@@ -142,121 +340,41 @@ fn main() -> Result<()> {
     let scan_root: PathBuf = PathBuf::from(&cfg.dir)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(&cfg.dir));
+    let cache = Cache::from_env(cfg.cache.clone());
 
     if cfg.scan {
-        return run_scan(&cfg, &scan_root);
+        return run_scan(&cfg, &cache, &scan_root);
     }
-
     if cfg.dump {
-        // Non-interactive dump mode
-        let repos = annex::find_annex_repos(&scan_root, &cfg.discover_options());
-        println!("git-annex-browser dump for {}", scan_root.display());
-        println!("found {} annex repos\n", repos.len());
-
-        let mut loaded: Vec<(PathBuf, annex::AnnexMetadata)> = Vec::new();
-        for r in &repos {
-            match annex::load_metadata(r) {
-                Ok(m) => loaded.push((r.clone(), m)),
-                Err(e) => eprintln!("  load {} failed: {}", r.display(), e),
-            }
-        }
-
-        let total_unique: u64 = loaded.iter().map(|(_, m)| m.unique_size).sum();
-        let total_consumed: u64 = loaded.iter().map(|(_, m)| m.consumed_size).sum();
-        let total_files: usize = loaded.iter().map(|(_, m)| m.files.len()).sum();
-        println!("REPORT:");
-        println!(
-            "  total unique data (1 copy per file): {}",
-            util::human_bytes(total_unique)
-        );
-        println!(
-            "  total storage across all drives (with copies): {}",
-            util::human_bytes(total_consumed)
-        );
-        println!("  total working tree files: {}", total_files);
-        let summaries: Vec<_> = loaded.iter().map(|(_, m)| m.to_summary()).collect();
-        let per_remote = annex::aggregate_remote_usage(&summaries);
-        if !per_remote.is_empty() {
-            println!("  storage per special remote (rclone etc.):");
-            for (name, bytes, keys, repos) in per_remote {
-                println!(
-                    "    - {} : {} ({} keys, {} repos)",
-                    name,
-                    util::human_bytes(bytes),
-                    keys,
-                    repos
-                );
-            }
-        }
-        println!();
-
-        for (r, m) in &loaded {
-            let clean = r
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| r.display().to_string());
-            let desc_note = if !m.description.is_empty() && m.description != clean {
-                format!(" ({})", m.description)
-            } else {
-                String::new()
-            };
-            println!("=== {}{} ===", clean, desc_note);
-            println!("  path: {}", r.display());
-            println!("  uuid: {}", m.uuid);
-            println!("  files in tree: {}, keys: {}", m.files.len(), m.total_keys);
-            println!(
-                "  unique size (1 copy): {}",
-                util::human_bytes(m.unique_size)
-            );
-            println!(
-                "  consumed across drives: {}",
-                util::human_bytes(m.consumed_size)
-            );
-            println!("  remotes/drives:");
-            let mut rems: Vec<_> = m.remotes.values().collect();
-            rems.sort_by_key(|r| {
-                (
-                    std::cmp::Reverse(r.last_fsck.unwrap_or(0)),
-                    r.name().to_string(),
-                )
-            });
-            for rem in rems {
-                let marker = if rem.uuid == m.uuid { " [HERE]" } else { "" };
-                let fs = rem
-                    .last_fsck
-                    .map(|t| format!(" fsck={}", util::fmt_unix(t)))
-                    .unwrap_or_default();
-                println!(
-                    "    - {} ({}){} trust={} present={} keys{}{}",
-                    rem.name(),
-                    rem.rtype(),
-                    marker,
-                    rem.trust.as_str(),
-                    rem.present_count,
-                    if rem.present_size > 0 {
-                        format!(" {}", util::human_bytes(rem.present_size))
-                    } else {
-                        String::new()
-                    },
-                    fs,
-                );
-            }
-            println!();
-        }
-        if !loaded.is_empty() {
-            let cache_repos = loaded
-                .into_iter()
-                .map(|(r, m)| (r.to_string_lossy().to_string(), m))
-                .collect();
-            let _ = annex::merge_scan_into_cache(&scan_root, cache_repos);
-        }
-        return Ok(());
+        return run_dump(&cfg, &cache, &scan_root);
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
+    let (worker, snap_rx, worker_thread) = worker::spawn(
+        WorkerConfig {
+            scan_root,
+            discover: cfg.discover_options(),
+            cache,
+            jobs: cfg.jobs,
+            offline: cfg.offline,
+            force_rescan: cfg.force_rescan,
+        },
+        Arc::clone(&cancel),
+    );
 
-    let (cmd_tx, snap_rx) = worker::spawn(scan_root, cfg.discover_options(), Arc::clone(&cancel));
+    let result = run_tui(&cfg, &worker, &snap_rx);
+    // Stop the worker and let it finish pending cache writes.
+    cancel.store(true, Ordering::Relaxed);
+    worker.send(WorkerMsg::Nav(Command::Quit, 0));
+    let _ = worker_thread.join();
+    result
+}
 
+fn run_tui(
+    cfg: &Config,
+    worker: &worker::WorkerHandle,
+    snap_rx: &std::sync::mpsc::Receiver<worker::WorkerOut>,
+) -> Result<()> {
     let mut guard = tui::TerminalGuard::new()?;
     let tick = Duration::from_millis(cfg.tick_ms.clamp(10, 1000));
     let mut ui = UiState::default();
@@ -289,21 +407,12 @@ fn main() -> Result<()> {
         let page = tui::page_size(&guard.term);
         match ui.handle_key(key, page) {
             UiAction::None => {}
-            UiAction::Quit => {
-                request_quit(&cancel, &cmd_tx);
-                break;
-            }
+            UiAction::Quit => return Ok(()),
             UiAction::Send(cmd) => {
-                if cmd_tx.send(WorkerMsg::Nav(cmd, page)).is_err() {
-                    break;
+                if !worker.send(WorkerMsg::Nav(cmd, page)) {
+                    return Ok(());
                 }
             }
         }
     }
-    Ok(())
-}
-
-fn request_quit(cancel: &Arc<AtomicBool>, cmd_tx: &std::sync::mpsc::Sender<WorkerMsg>) {
-    cancel.store(true, Ordering::Relaxed);
-    let _ = cmd_tx.send(WorkerMsg::Nav(Command::Quit, 0));
 }

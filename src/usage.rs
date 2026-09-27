@@ -6,6 +6,7 @@ use crate::util::human_bytes;
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct UsageChild {
@@ -166,7 +167,7 @@ impl Node for ParentDirNode {
 }
 
 pub struct UsageDirNode {
-    meta: Rc<AnnexMetadata>,
+    meta: Arc<AnnexMetadata>,
     tree: Rc<UsageTree>,
     dir_path: String,
     children: OnceCell<Children>,
@@ -174,7 +175,7 @@ pub struct UsageDirNode {
 
 impl UsageDirNode {
     /// Top of the usage tree. `tree` is built once per loaded repo and shared.
-    pub fn root(meta: Rc<AnnexMetadata>, tree: Rc<UsageTree>) -> Self {
+    pub fn root(meta: Arc<AnnexMetadata>, tree: Rc<UsageTree>) -> Self {
         Self {
             meta,
             tree,
@@ -236,7 +237,7 @@ impl Node for UsageDirNode {
             for child in self.tree.children_sorted(&self.dir_path) {
                 if child.is_dir {
                     kids.push(Rc::new(UsageDirNode {
-                        meta: Rc::clone(&self.meta),
+                        meta: Arc::clone(&self.meta),
                         tree: Rc::clone(&self.tree),
                         dir_path: child.rel_path.clone(),
                         children: OnceCell::new(),
@@ -245,7 +246,7 @@ impl Node for UsageDirNode {
                     && let Some(f) = self.meta.files.get(idx)
                 {
                     kids.push(Rc::new(UsageFileNode {
-                        meta: Rc::clone(&self.meta),
+                        meta: Arc::clone(&self.meta),
                         file: f.clone(),
                         name: child.name.clone(),
                         size: child.size,
@@ -291,7 +292,7 @@ impl Node for UsageDirNode {
 }
 
 pub struct UsageFileNode {
-    meta: Rc<AnnexMetadata>,
+    meta: Arc<AnnexMetadata>,
     file: AnnexedFile,
     name: String,
     size: u64,

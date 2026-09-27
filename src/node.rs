@@ -14,6 +14,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// What a row in the browser represents. Drives colours, visuals and navigation rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,14 +133,21 @@ fn cached(cell: &OnceCell<Children>, build: impl FnOnce() -> Vec<Rc<dyn Node>>) 
 pub struct RootNode {
     pub scan_root: PathBuf,
     pub summaries: Rc<[RepoSummary]>,
+    /// Cached repos the last discovery did not find: path -> unix time first missed.
+    pub missing: Rc<HashMap<PathBuf, i64>>,
     children: OnceCell<Children>,
 }
 
 impl RootNode {
-    pub fn new(scan_root: PathBuf, summaries: Rc<[RepoSummary]>) -> Self {
+    pub fn new(
+        scan_root: PathBuf,
+        summaries: Rc<[RepoSummary]>,
+        missing: Rc<HashMap<PathBuf, i64>>,
+    ) -> Self {
         Self {
             scan_root,
             summaries,
+            missing,
             children: OnceCell::new(),
         }
     }
@@ -161,6 +169,7 @@ impl Node for RootNode {
                 Rc::new(RepoSummaryNode {
                     summaries: Rc::clone(&self.summaries),
                     idx,
+                    missing_since: self.missing.get(&self.summaries[idx].root).copied(),
                 }) as Rc<dyn Node>
             }));
             kids
@@ -270,6 +279,8 @@ impl Node for RepoLoadingNode {
 pub struct RepoSummaryNode {
     summaries: Rc<[RepoSummary]>,
     idx: usize,
+    /// Set when the repo is cached but was not found on disk (drive not mounted).
+    missing_since: Option<i64>,
 }
 
 impl RepoSummaryNode {
@@ -286,9 +297,13 @@ impl Node for RepoSummaryNode {
         } else {
             String::new()
         };
+        let gone = match self.missing_since {
+            Some(ts) => format!("  (not found since {})", fmt_unix(ts)),
+            None => String::new(),
+        };
         format!(
-            "{}{} — {} files, {} drives",
-            s.name, desc, s.file_count, s.remote_count
+            "{}{} — {} files, {} drives{}",
+            s.name, desc, s.file_count, s.remote_count, gone
         )
     }
     fn kind(&self) -> NodeKind {
@@ -297,12 +312,21 @@ impl Node for RepoSummaryNode {
     fn annex_repo_path(&self) -> Option<&Path> {
         Some(&self.summary().root)
     }
+    fn present(&self) -> Option<bool> {
+        self.missing_since.map(|_| false)
+    }
     fn under_copies(&self) -> bool {
         self.summary().keys_under > 0
     }
     fn details(&self) -> Vec<String> {
         let s = self.summary();
         let mut d = vec![format!("path: {}", s.root.display())];
+        if let Some(ts) = self.missing_since {
+            d.push(format!(
+                "not found on disk since {} — showing cached data (drive unplugged?)",
+                fmt_unix(ts)
+            ));
+        }
         if !s.uuid.is_empty() {
             d.push(format!("uuid: {}", s.uuid));
         }
@@ -336,13 +360,16 @@ impl Node for RepoSummaryNode {
 
 /// Fully loaded repo. This is the interesting level.
 pub struct RepoNode {
-    pub meta: Rc<AnnexMetadata>,
+    pub meta: Arc<AnnexMetadata>,
     pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
     children: OnceCell<Children>,
 }
 
 impl RepoNode {
-    pub fn new(meta: Rc<AnnexMetadata>, drive_profiles: Rc<HashMap<String, DriveProfile>>) -> Self {
+    pub fn new(
+        meta: Arc<AnnexMetadata>,
+        drive_profiles: Rc<HashMap<String, DriveProfile>>,
+    ) -> Self {
         Self {
             meta,
             drive_profiles,
@@ -387,22 +414,22 @@ impl Node for RepoNode {
                 Rc::new(RepoVisualNode {
                     root: meta.root.clone(),
                 }),
-                Rc::new(UsageDirNode::root(Rc::clone(meta), usage)),
+                Rc::new(UsageDirNode::root(Arc::clone(meta), usage)),
                 Rc::new(DrivesNode {
-                    meta: Rc::clone(meta),
+                    meta: Arc::clone(meta),
                     drive_profiles: Rc::clone(&self.drive_profiles),
                 }),
                 Rc::new(RepoInfoNode {
-                    meta: Rc::clone(meta),
+                    meta: Arc::clone(meta),
                 }),
             ];
             if !meta.files.is_empty() {
-                kids.push(Rc::new(FileTreeNode::all_files(Rc::clone(meta))));
+                kids.push(Rc::new(FileTreeNode::all_files(Arc::clone(meta))));
             }
             // Quick link to files present locally
             if meta.remotes.contains_key(&meta.uuid) {
                 kids.push(Rc::new(FileTreeNode::on_drive(
-                    Rc::clone(meta),
+                    Arc::clone(meta),
                     meta.uuid.clone(),
                     "here".to_string(),
                 )));
@@ -435,7 +462,7 @@ impl Node for RepoNode {
 }
 
 pub struct RepoInfoNode {
-    pub meta: Rc<AnnexMetadata>,
+    pub meta: Arc<AnnexMetadata>,
 }
 
 impl Node for RepoInfoNode {
@@ -527,7 +554,7 @@ impl Node for RepoVisualNode {
 
 /// List of all drives/remotes for the repo.
 pub struct DrivesNode {
-    pub meta: Rc<AnnexMetadata>,
+    pub meta: Arc<AnnexMetadata>,
     pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
 }
 
@@ -549,7 +576,7 @@ impl Node for DrivesNode {
                     .get(r.name())
                     .is_some_and(|p| p.has_variation() && !p.matches_common(r));
                 Rc::new(DriveNode {
-                    meta: Rc::clone(&self.meta),
+                    meta: Arc::clone(&self.meta),
                     remote: r.clone(),
                     anomalous,
                 }) as Rc<dyn Node>
@@ -606,7 +633,7 @@ impl Node for DrivesNode {
 }
 
 pub struct DriveNode {
-    pub meta: Rc<AnnexMetadata>,
+    pub meta: Arc<AnnexMetadata>,
     pub remote: Remote,
     pub anomalous: bool,
 }
@@ -654,7 +681,7 @@ impl Node for DriveNode {
         })];
         if self.remote.present_count > 0 {
             kids.push(Rc::new(FileTreeNode::on_drive(
-                Rc::clone(&self.meta),
+                Arc::clone(&self.meta),
                 self.remote.uuid.clone(),
                 self.remote.name().to_string(),
             )));
@@ -755,7 +782,7 @@ impl TreeScope {
 /// One level of the annexed-files tree: the "all files" and "files on drive"
 /// entries (at `dir_path == ""`) and every directory below them.
 pub struct FileTreeNode {
-    meta: Rc<AnnexMetadata>,
+    meta: Arc<AnnexMetadata>,
     scope: TreeScope,
     /// `""` for the top of the tree, else `a/b`.
     dir_path: String,
@@ -763,7 +790,7 @@ pub struct FileTreeNode {
 }
 
 impl FileTreeNode {
-    pub fn all_files(meta: Rc<AnnexMetadata>) -> Self {
+    pub fn all_files(meta: Arc<AnnexMetadata>) -> Self {
         Self {
             meta,
             scope: TreeScope::All,
@@ -772,7 +799,7 @@ impl FileTreeNode {
         }
     }
 
-    pub fn on_drive(meta: Rc<AnnexMetadata>, drive_uuid: String, drive_name: String) -> Self {
+    pub fn on_drive(meta: Arc<AnnexMetadata>, drive_uuid: String, drive_name: String) -> Self {
         Self {
             meta,
             scope: TreeScope::Drive(drive_uuid, drive_name),
@@ -822,7 +849,7 @@ impl FileTreeNode {
             .into_iter()
             .map(|sd| {
                 Rc::new(FileTreeNode {
-                    meta: Rc::clone(&self.meta),
+                    meta: Arc::clone(&self.meta),
                     scope: self.scope.clone(),
                     dir_path: format!("{prefix}{sd}"),
                     children: OnceCell::new(),
@@ -833,7 +860,7 @@ impl FileTreeNode {
             .into_iter()
             .map(|f| {
                 Rc::new(AnnexFileNode {
-                    meta: Rc::clone(&self.meta),
+                    meta: Arc::clone(&self.meta),
                     file: f.clone(),
                     highlight_drive: highlight.clone(),
                 }) as Rc<dyn Node>
@@ -846,7 +873,7 @@ impl FileTreeNode {
             for (key, locs) in &self.meta.locations {
                 if locs.contains(drive) && !seen_keys.contains(key.as_str()) {
                     files.push(Rc::new(AnnexFileNode {
-                        meta: Rc::clone(&self.meta),
+                        meta: Arc::clone(&self.meta),
                         file: AnnexedFile {
                             path: format!("<unused key> {key}"),
                             key: key.clone(),
@@ -963,7 +990,7 @@ pub fn file_raw(meta: &AnnexMetadata, file: &AnnexedFile) -> Option<String> {
 
 /// A single annexed file. Details list all locations.
 pub struct AnnexFileNode {
-    pub meta: Rc<AnnexMetadata>,
+    pub meta: Arc<AnnexMetadata>,
     pub file: AnnexedFile,
     pub highlight_drive: Option<String>,
 }

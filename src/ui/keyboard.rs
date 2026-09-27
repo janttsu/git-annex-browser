@@ -15,6 +15,7 @@ pub fn map_key(key: KeyEvent) -> Command {
         KeyCode::Right | KeyCode::Enter | KeyCode::Char('l') => Command::Descend,
         KeyCode::Left | KeyCode::Backspace | KeyCode::Char('h') => Command::Back,
         KeyCode::Char('r') | KeyCode::F(5) => Command::Refresh,
+        KeyCode::Char('s') => Command::CycleSort,
         KeyCode::Char('?') | KeyCode::F(1) => Command::ToggleHelp,
         _ => Command::None,
     }
