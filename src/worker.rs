@@ -31,6 +31,7 @@ pub struct Worker {
 
 pub fn spawn(
     scan_root: PathBuf,
+    discover: annex::DiscoverOptions,
     cancel: Arc<AtomicBool>,
 ) -> (Sender<WorkerMsg>, Receiver<WorkerOut>) {
     let (cmd_tx, cmd_rx) = mpsc::channel();
@@ -68,7 +69,7 @@ pub fn spawn(
         }
 
         // 2. On-disk discovery (always). Cache snapshot already went to the UI.
-        let discovered = annex::find_annex_repos(&scan_root);
+        let discovered = annex::find_annex_repos(&scan_root, &discover);
 
         worker
             .app
@@ -177,7 +178,7 @@ pub fn spawn(
                         worker.app.status = format!("err: {}", e);
                     }
                     if cmd == Command::Refresh {
-                        let repos = annex::find_annex_repos(&scan_root);
+                        let repos = annex::find_annex_repos(&scan_root, &discover);
                         worker
                             .app
                             .summaries

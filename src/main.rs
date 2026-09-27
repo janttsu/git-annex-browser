@@ -50,6 +50,23 @@ struct Config {
     /// Suppress progress and summary output (useful with --scan for cron jobs).
     #[arg(long)]
     quiet: bool,
+
+    /// Maximum directory depth below DIR when looking for annexes.
+    #[arg(long, value_name = "N")]
+    max_depth: Option<usize>,
+
+    /// Do not descend into other mounted filesystems while looking for annexes.
+    #[arg(long)]
+    one_file_system: bool,
+}
+
+impl Config {
+    fn discover_options(&self) -> annex::DiscoverOptions {
+        annex::DiscoverOptions {
+            max_depth: self.max_depth,
+            one_file_system: self.one_file_system,
+        }
+    }
 }
 
 fn run_scan(cfg: &Config, scan_root: &Path) -> Result<()> {
@@ -62,7 +79,7 @@ fn run_scan(cfg: &Config, scan_root: &Path) -> Result<()> {
         );
     }
 
-    let repos = annex::find_annex_repos(scan_root);
+    let repos = annex::find_annex_repos(scan_root, &cfg.discover_options());
 
     if !quiet {
         eprintln!("Found {} repos", repos.len());
@@ -132,7 +149,7 @@ fn main() -> Result<()> {
 
     if cfg.dump {
         // Non-interactive dump mode
-        let repos = annex::find_annex_repos(&scan_root);
+        let repos = annex::find_annex_repos(&scan_root, &cfg.discover_options());
         println!("git-annex-browser dump for {}", scan_root.display());
         println!("found {} annex repos\n", repos.len());
 
@@ -238,7 +255,7 @@ fn main() -> Result<()> {
 
     let cancel = Arc::new(AtomicBool::new(false));
 
-    let (cmd_tx, snap_rx) = worker::spawn(scan_root, Arc::clone(&cancel));
+    let (cmd_tx, snap_rx) = worker::spawn(scan_root, cfg.discover_options(), Arc::clone(&cancel));
 
     let mut guard = tui::TerminalGuard::new()?;
     let tick = Duration::from_millis(cfg.tick_ms.clamp(10, 1000));
