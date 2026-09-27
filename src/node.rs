@@ -1,16 +1,18 @@
 /*!
 The browsable tree model for git-annex.
 
-Similar structure to zfs-browser: everything is a Node.
+Similar structure to zfs-browser: everything is a Node. Child lists are built
+once per node and shared as `Rc<[..]>`, so moving the selection never rebuilds them.
 */
 
 use crate::annex::{
-    AnnexMetadata, AnnexedFile, DriveProfile, Remote, TrustLevel, parse_size_from_key,
+    AnnexMetadata, AnnexedFile, DriveProfile, Remote, RepoSummary, TrustLevel, parse_size_from_key,
 };
-use crate::usage::{UsageDirNode, UsageListing};
+use crate::usage::{UsageDirNode, UsageListing, UsageTree};
 use crate::util::{fmt_unix, human_bytes, short_uuid};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::cell::OnceCell;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// What a row in the browser represents. Drives colours, visuals and navigation rules.
@@ -62,11 +64,18 @@ impl std::fmt::Display for NodeKind {
     }
 }
 
+/// Shared, immutable list of child nodes.
+pub type Children = Rc<[Rc<dyn Node>]>;
+
+pub fn no_children() -> Children {
+    Rc::from(Vec::<Rc<dyn Node>>::new())
+}
+
 pub trait Node {
     fn label(&self) -> String;
     fn kind(&self) -> NodeKind;
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        vec![]
+    fn children(&self) -> Children {
+        no_children()
     }
     fn details(&self) -> Vec<String> {
         vec![]
@@ -76,11 +85,11 @@ pub trait Node {
         None
     }
     /// If this is a summary for a repo that needs full load on descend, return its path.
-    fn annex_repo_path(&self) -> Option<&std::path::Path> {
+    fn annex_repo_path(&self) -> Option<&Path> {
         None
     }
     /// If this node represents a loading state, return the path being loaded.
-    fn loading_path(&self) -> Option<std::path::PathBuf> {
+    fn loading_path(&self) -> Option<&Path> {
         None
     }
     /// Whether this item (typically a drive) has setup that differs from other repos' same-named drive.
@@ -91,7 +100,7 @@ pub trait Node {
         None
     }
     /// Fully loaded repo node for this annex path (not the summary placeholder).
-    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+    fn loaded_repo_path(&self) -> Option<&Path> {
         None
     }
     /// Annex size for ncdu-style listings (git-annex key size, not the filesystem).
@@ -115,17 +124,23 @@ pub trait Node {
     }
 }
 
+fn cached(cell: &OnceCell<Children>, build: impl FnOnce() -> Vec<Rc<dyn Node>>) -> Children {
+    Rc::clone(cell.get_or_init(|| Rc::from(build())))
+}
+
 /// Top level: discovered repos under the scan dir.
 pub struct RootNode {
     pub scan_root: PathBuf,
-    pub summaries: Vec<crate::annex::RepoSummary>,
+    pub summaries: Rc<[RepoSummary]>,
+    children: OnceCell<Children>,
 }
 
 impl RootNode {
-    pub fn new(scan_root: PathBuf) -> Self {
+    pub fn new(scan_root: PathBuf, summaries: Rc<[RepoSummary]>) -> Self {
         Self {
             scan_root,
-            summaries: vec![],
+            summaries,
+            children: OnceCell::new(),
         }
     }
 }
@@ -137,16 +152,19 @@ impl Node for RootNode {
     fn kind(&self) -> NodeKind {
         NodeKind::Root
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(GlobalReportNode {
-            summaries: self.summaries.clone(),
-        }) as Rc<dyn Node>];
-        kids.extend(
-            self.summaries
-                .iter()
-                .map(|s| Rc::new(RepoSummaryNode { summary: s.clone() }) as Rc<dyn Node>),
-        );
-        kids
+    fn children(&self) -> Children {
+        cached(&self.children, || {
+            let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(GlobalReportNode {
+                summaries: Rc::clone(&self.summaries),
+            })];
+            kids.extend((0..self.summaries.len()).map(|idx| {
+                Rc::new(RepoSummaryNode {
+                    summaries: Rc::clone(&self.summaries),
+                    idx,
+                }) as Rc<dyn Node>
+            }));
+            kids
+        })
     }
     fn details(&self) -> Vec<String> {
         vec![
@@ -161,7 +179,7 @@ impl Node for RootNode {
 /// Global info/summary node shown first at root level.
 /// Shows aggregates across ALL scanned repos.
 pub struct GlobalReportNode {
-    pub summaries: Vec<crate::annex::RepoSummary>,
+    pub summaries: Rc<[RepoSummary]>,
 }
 
 impl Node for GlobalReportNode {
@@ -170,9 +188,6 @@ impl Node for GlobalReportNode {
     }
     fn kind(&self) -> NodeKind {
         NodeKind::Report
-    }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        vec![]
     }
     fn details(&self) -> Vec<String> {
         let num_repos = self.summaries.len();
@@ -246,19 +261,26 @@ impl Node for RepoLoadingNode {
     fn details(&self) -> Vec<String> {
         vec!["Loading git-annex metadata in background...".into()]
     }
-    fn loading_path(&self) -> Option<std::path::PathBuf> {
-        Some(self.path.clone())
+    fn loading_path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 }
 
 /// Summary / entry for a repo before full load. Carries lightweight info for instant nice list.
 pub struct RepoSummaryNode {
-    pub summary: crate::annex::RepoSummary,
+    summaries: Rc<[RepoSummary]>,
+    idx: usize,
+}
+
+impl RepoSummaryNode {
+    fn summary(&self) -> &RepoSummary {
+        &self.summaries[self.idx]
+    }
 }
 
 impl Node for RepoSummaryNode {
     fn label(&self) -> String {
-        let s = &self.summary;
+        let s = self.summary();
         let desc = if !s.annex_description.is_empty() && s.annex_description != s.name {
             format!(" ({})", s.annex_description)
         } else {
@@ -272,17 +294,14 @@ impl Node for RepoSummaryNode {
     fn kind(&self) -> NodeKind {
         NodeKind::Repo
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        vec![]
-    }
-    fn annex_repo_path(&self) -> Option<&std::path::Path> {
-        Some(&self.summary.root)
+    fn annex_repo_path(&self) -> Option<&Path> {
+        Some(&self.summary().root)
     }
     fn under_copies(&self) -> bool {
-        self.summary.keys_under > 0
+        self.summary().keys_under > 0
     }
     fn details(&self) -> Vec<String> {
-        let s = &self.summary;
+        let s = self.summary();
         let mut d = vec![format!("path: {}", s.root.display())];
         if !s.uuid.is_empty() {
             d.push(format!("uuid: {}", s.uuid));
@@ -301,6 +320,12 @@ impl Node for RepoSummaryNode {
             "consumed across drives: {}",
             human_bytes(s.consumed_size)
         ));
+        if s.keys_under > 0 {
+            d.push(format!(
+                "keys under numcopies: {} of {}",
+                s.keys_under, s.keys_tracked
+            ));
+        }
         d.push(
             "→ descend to see drives (sorted by last fsck), groups, wanted, numcopies etc."
                 .to_string(),
@@ -313,30 +338,35 @@ impl Node for RepoSummaryNode {
 pub struct RepoNode {
     pub meta: Rc<AnnexMetadata>,
     pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
+    children: OnceCell<Children>,
 }
 
 impl RepoNode {
-    pub fn new(meta: Rc<AnnexMetadata>) -> Self {
+    pub fn new(meta: Rc<AnnexMetadata>, drive_profiles: Rc<HashMap<String, DriveProfile>>) -> Self {
         Self {
             meta,
-            drive_profiles: Rc::new(HashMap::new()),
+            drive_profiles,
+            children: OnceCell::new(),
         }
     }
-    pub fn with_profiles(mut self, profiles: Rc<HashMap<String, DriveProfile>>) -> Self {
-        self.drive_profiles = profiles;
-        self
-    }
+}
+
+/// Directory name (`a/b/`) of the last path component.
+fn dir_label(dir_path: &str) -> String {
+    format!("{}/", dir_path.rsplit('/').next().unwrap_or(dir_path))
+}
+
+fn repo_display_name(meta: &AnnexMetadata) -> String {
+    meta.root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| meta.description.clone())
 }
 
 impl Node for RepoNode {
     fn label(&self) -> String {
         let short = short_uuid(&self.meta.uuid);
-        let clean_name = self
-            .meta
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| self.meta.description.clone());
+        let clean_name = repo_display_name(&self.meta);
         if clean_name != self.meta.description && !self.meta.description.is_empty() {
             format!("{} ({}) [{}]", clean_name, self.meta.description, short)
         } else {
@@ -346,39 +376,39 @@ impl Node for RepoNode {
     fn kind(&self) -> NodeKind {
         NodeKind::Repo
     }
-    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+    fn loaded_repo_path(&self) -> Option<&Path> {
         Some(&self.meta.root)
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut kids: Vec<Rc<dyn Node>> = vec![
-            Rc::new(RepoVisualNode {
-                root: self.meta.root.clone(),
-            }),
-            Rc::new(UsageDirNode::root(Rc::clone(&self.meta))),
-            Rc::new(DrivesNode {
-                meta: Rc::clone(&self.meta),
-                drive_profiles: Rc::clone(&self.drive_profiles),
-            }),
-            Rc::new(RepoInfoNode {
-                meta: Rc::clone(&self.meta),
-            }),
-        ];
-        if !self.meta.files.is_empty() {
-            kids.push(Rc::new(AllFilesNode {
-                meta: Rc::clone(&self.meta),
-                cached_children: std::cell::RefCell::new(None),
-            }));
-        }
-        // Quick link to files present locally
-        if self.meta.remotes.contains_key(&self.meta.uuid) {
-            kids.push(Rc::new(FilesOnDriveNode {
-                meta: Rc::clone(&self.meta),
-                drive_uuid: self.meta.uuid.clone(),
-                drive_name: "here".to_string(),
-                cached_children: std::cell::RefCell::new(None),
-            }));
-        }
-        kids
+    fn children(&self) -> Children {
+        cached(&self.children, || {
+            let meta = &self.meta;
+            let usage = Rc::new(UsageTree::build(&meta.files));
+            let mut kids: Vec<Rc<dyn Node>> = vec![
+                Rc::new(RepoVisualNode {
+                    root: meta.root.clone(),
+                }),
+                Rc::new(UsageDirNode::root(Rc::clone(meta), usage)),
+                Rc::new(DrivesNode {
+                    meta: Rc::clone(meta),
+                    drive_profiles: Rc::clone(&self.drive_profiles),
+                }),
+                Rc::new(RepoInfoNode {
+                    meta: Rc::clone(meta),
+                }),
+            ];
+            if !meta.files.is_empty() {
+                kids.push(Rc::new(FileTreeNode::all_files(Rc::clone(meta))));
+            }
+            // Quick link to files present locally
+            if meta.remotes.contains_key(&meta.uuid) {
+                kids.push(Rc::new(FileTreeNode::on_drive(
+                    Rc::clone(meta),
+                    meta.uuid.clone(),
+                    "here".to_string(),
+                )));
+            }
+            kids
+        })
     }
     fn details(&self) -> Vec<String> {
         let m = &self.meta;
@@ -417,11 +447,7 @@ impl Node for RepoInfoNode {
     }
     fn details(&self) -> Vec<String> {
         let m = &self.meta;
-        let clean = m
-            .root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| m.description.clone());
+        let clean = repo_display_name(m);
         let mut rows = vec![
             format!("repo path: {}", m.root.display()),
             format!(
@@ -437,25 +463,12 @@ impl Node for RepoInfoNode {
             format!("working tree annexed files: {}", m.files.len()),
             format!("unique keys tracked: {}", m.total_keys),
         ];
-        // Quick stats
-        let trusted = m
-            .remotes
-            .values()
-            .filter(|r| r.trust == TrustLevel::Trusted)
-            .count();
-        let semi = m
-            .remotes
-            .values()
-            .filter(|r| r.trust == TrustLevel::SemiTrusted)
-            .count();
-        let untr = m
-            .remotes
-            .values()
-            .filter(|r| r.trust == TrustLevel::UnTrusted)
-            .count();
+        let count = |t: TrustLevel| m.remotes.values().filter(|r| r.trust == t).count();
         rows.push(format!(
             "trust summary: {} trusted, {} semitrusted, {} untrusted",
-            trusted, semi, untr
+            count(TrustLevel::Trusted),
+            count(TrustLevel::SemiTrusted),
+            count(TrustLevel::UnTrusted)
         ));
         if let Some(n) = m.numcopies {
             rows.push(format!("numcopies: {}", n));
@@ -465,15 +478,7 @@ impl Node for RepoInfoNode {
             if let Some(ts) = h.last_fsck {
                 rows.push(format!("last fsck (here): {}", fmt_unix(ts)));
             }
-            if !h.groups.is_empty() {
-                rows.push(format!("groups: {}", h.groups.join(", ")));
-            }
-            if let Some(w) = &h.wanted {
-                rows.push(format!("wanted: {}", w));
-            }
-            if let Some(req) = &h.required {
-                rows.push(format!("required: {}", req));
-            }
+            push_remote_prefs(&mut rows, h);
         }
         if !m.additional_configs.is_empty() {
             rows.push("additional configs:".into());
@@ -485,7 +490,18 @@ impl Node for RepoInfoNode {
     }
 }
 
-/// List of all drives/remotes for the repo.
+fn push_remote_prefs(rows: &mut Vec<String>, r: &Remote) {
+    if !r.groups.is_empty() {
+        rows.push(format!("groups: {}", r.groups.join(", ")));
+    }
+    if let Some(w) = &r.wanted {
+        rows.push(format!("wanted: {}", w));
+    }
+    if let Some(req) = &r.required {
+        rows.push(format!("required: {}", req));
+    }
+}
+
 /// Per-repo visual dashboard (opened from inside a repo).
 pub struct RepoVisualNode {
     pub root: PathBuf,
@@ -498,7 +514,7 @@ impl Node for RepoVisualNode {
     fn kind(&self) -> NodeKind {
         NodeKind::Viz
     }
-    fn loaded_repo_path(&self) -> Option<&std::path::Path> {
+    fn loaded_repo_path(&self) -> Option<&Path> {
         Some(&self.root)
     }
     fn details(&self) -> Vec<String> {
@@ -509,6 +525,7 @@ impl Node for RepoVisualNode {
     }
 }
 
+/// List of all drives/remotes for the repo.
 pub struct DrivesNode {
     pub meta: Rc<AnnexMetadata>,
     pub drive_profiles: Rc<HashMap<String, DriveProfile>>,
@@ -521,25 +538,19 @@ impl Node for DrivesNode {
     fn kind(&self) -> NodeKind {
         NodeKind::Drives
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut list: Vec<_> = self.meta.remotes.values().cloned().collect();
+    fn children(&self) -> Children {
+        let mut list: Vec<&Remote> = self.meta.remotes.values().collect();
         // Sort by last fsck time (most recent first). Falls back to name.
-        // This gives visibility into which drives were fsck'ed recently.
-        list.sort_by_key(|r| {
-            let fsck_ts = r.last_fsck.unwrap_or(0);
-            (std::cmp::Reverse(fsck_ts), r.name().to_string())
-        });
+        list.sort_by_key(|r| (std::cmp::Reverse(r.last_fsck.unwrap_or(0)), r.name()));
         list.into_iter()
             .map(|r| {
-                let name = r.name().to_string();
-                let anomalous = if let Some(p) = self.drive_profiles.get(&name) {
-                    p.has_variation() && !self.matches_common(p, &r)
-                } else {
-                    false
-                };
+                let anomalous = self
+                    .drive_profiles
+                    .get(r.name())
+                    .is_some_and(|p| p.has_variation() && !p.matches_common(r));
                 Rc::new(DriveNode {
                     meta: Rc::clone(&self.meta),
-                    remote: r,
+                    remote: r.clone(),
                     anomalous,
                 }) as Rc<dyn Node>
             })
@@ -570,21 +581,18 @@ impl Node for DrivesNode {
         }
         // Detect drives that are commonly present elsewhere but missing here ( "not configured" )
         if self.drive_profiles.len() > 3 {
-            let my_names: std::collections::HashSet<_> = self
-                .meta
-                .remotes
-                .values()
-                .map(|r| r.name().to_string())
+            let my_names: HashSet<&str> = self.meta.remotes.values().map(|r| r.name()).collect();
+            let mut missing_common: Vec<&str> = self
+                .drive_profiles
+                .iter()
+                .filter(|(name, prof)| {
+                    !my_names.contains(name.as_str())
+                        && prof.has_variation()
+                        && prof.trusts.values().sum::<usize>() >= 3
+                })
+                .map(|(name, _)| name.as_str())
                 .collect();
-            let mut missing_common: Vec<String> = vec![];
-            for (name, prof) in self.drive_profiles.iter() {
-                if !my_names.contains(name) && prof.has_variation() {
-                    // appears in multiple configs but not in this repo
-                    if prof.trusts.values().sum::<usize>() >= 3 {
-                        missing_common.push(name.clone());
-                    }
-                }
-            }
+            missing_common.sort();
             if !missing_common.is_empty() {
                 d.push("".into());
                 d.push(format!(
@@ -640,19 +648,18 @@ impl Node for DriveNode {
             NodeKind::Repo
         }
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
+    fn children(&self) -> Children {
         let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(DriveInfoNode {
             remote: self.remote.clone(),
         })];
         if self.remote.present_count > 0 {
-            kids.push(Rc::new(FilesOnDriveNode {
-                meta: Rc::clone(&self.meta),
-                drive_uuid: self.remote.uuid.clone(),
-                drive_name: self.remote.name().to_string(),
-                cached_children: std::cell::RefCell::new(None),
-            }));
+            kids.push(Rc::new(FileTreeNode::on_drive(
+                Rc::clone(&self.meta),
+                self.remote.uuid.clone(),
+                self.remote.name().to_string(),
+            )));
         }
-        kids
+        Rc::from(kids)
     }
     fn details(&self) -> Vec<String> {
         let r = &self.remote;
@@ -667,25 +674,18 @@ impl Node for DriveNode {
         if let Some(ts) = r.last_fsck {
             d.push(format!("last fsck: {}", fmt_unix(ts)));
         }
-        if !r.groups.is_empty() {
-            d.push(format!("groups: {}", r.groups.join(", ")));
-        }
-        if let Some(w) = &r.wanted {
-            d.push(format!("wanted: {}", w));
-        }
-        if let Some(req) = &r.required {
-            d.push(format!("required: {}", req));
-        }
-        for (k, v) in &r.config {
-            if k == "name" || k == "type" {
-                continue;
-            }
-            if matches!(
-                k.as_str(),
-                "cipher" | "embedcreds" | "encryptionkey" | "secret" | "password" | "keyid"
-            ) {
-                continue;
-            }
+        push_remote_prefs(&mut d, r);
+        let mut cfg: Vec<_> = r
+            .config
+            .iter()
+            .filter(|(k, _)| {
+                k.as_str() != "name"
+                    && k.as_str() != "type"
+                    && !crate::annex::is_secret_remote_key(k)
+            })
+            .collect();
+        cfg.sort();
+        for (k, v) in cfg {
             d.push(format!("{}: {}", k, v));
         }
         d
@@ -696,34 +696,6 @@ impl Node for DriveNode {
     }
     fn trust(&self) -> Option<TrustLevel> {
         Some(self.remote.trust)
-    }
-}
-
-impl DrivesNode {
-    fn matches_common(&self, p: &crate::annex::DriveProfile, r: &crate::annex::Remote) -> bool {
-        if let Some(ct) = p.most_common_trust()
-            && r.trust != ct
-        {
-            return false;
-        }
-        if let Some(cg) = p.most_common_groups() {
-            let mut myg = r.groups.clone();
-            myg.sort();
-            if myg != cg {
-                return false;
-            }
-        }
-        if let Some(cw) = p.most_common_wanted()
-            && r.wanted.as_deref() != Some(cw.as_str())
-        {
-            return false;
-        }
-        if let Some(cr) = p.most_common_required()
-            && r.required.as_deref() != Some(cr.as_str())
-        {
-            return false;
-        }
-        true
     }
 }
 
@@ -754,15 +726,7 @@ impl Node for DriveInfoNode {
             "Storage used on this: {}",
             human_bytes(r.present_size)
         ));
-        if !r.groups.is_empty() {
-            rows.push(format!("groups: {}", r.groups.join(", ")));
-        }
-        if let Some(w) = &r.wanted {
-            rows.push(format!("wanted: {}", w));
-        }
-        if let Some(req) = &r.required {
-            rows.push(format!("required: {}", req));
-        }
+        push_remote_prefs(&mut rows, r);
         if let Some(path) = r.config.get("directory") {
             rows.push(format!("directory: {}", path));
         }
@@ -770,101 +734,231 @@ impl Node for DriveInfoNode {
     }
 }
 
-/// Files present on a specific drive/remote (or here).
-pub struct FilesOnDriveNode {
-    pub meta: Rc<AnnexMetadata>,
-    pub drive_uuid: String,
-    pub drive_name: String,
-    cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,
+/// Which directory tree a `FileTreeNode` shows.
+#[derive(Clone)]
+enum TreeScope {
+    /// All annexed files in the working tree.
+    All,
+    /// Only files whose content is recorded on this drive (uuid, display name).
+    Drive(String, String),
 }
 
-impl Node for FilesOnDriveNode {
-    fn label(&self) -> String {
-        let cnt = self
-            .meta
-            .locations
-            .values()
-            .filter(|s| s.contains(&self.drive_uuid))
-            .count();
-        format!("files on {} ({})", self.drive_name, cnt)
-    }
-    fn kind(&self) -> NodeKind {
-        NodeKind::Files
-    }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut cache = self.cached_children.borrow_mut();
-        if let Some(cached) = cache.as_ref() {
-            return cached.clone();
+impl TreeScope {
+    fn drive_uuid(&self) -> Option<&str> {
+        match self {
+            TreeScope::All => None,
+            TreeScope::Drive(u, _) => Some(u),
         }
+    }
+}
 
-        // Use cached location logs so offline drives stay browsable.
-        let mut out = vec![];
-        let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut direct_files: Vec<AnnexedFile> = vec![];
-        let mut current_keys: HashSet<String> = HashSet::new();
+/// One level of the annexed-files tree: the "all files" and "files on drive"
+/// entries (at `dir_path == ""`) and every directory below them.
+pub struct FileTreeNode {
+    meta: Rc<AnnexMetadata>,
+    scope: TreeScope,
+    /// `""` for the top of the tree, else `a/b`.
+    dir_path: String,
+    children: OnceCell<Children>,
+}
+
+impl FileTreeNode {
+    pub fn all_files(meta: Rc<AnnexMetadata>) -> Self {
+        Self {
+            meta,
+            scope: TreeScope::All,
+            dir_path: String::new(),
+            children: OnceCell::new(),
+        }
+    }
+
+    pub fn on_drive(meta: Rc<AnnexMetadata>, drive_uuid: String, drive_name: String) -> Self {
+        Self {
+            meta,
+            scope: TreeScope::Drive(drive_uuid, drive_name),
+            dir_path: String::new(),
+            children: OnceCell::new(),
+        }
+    }
+
+    fn is_top(&self) -> bool {
+        self.dir_path.is_empty()
+    }
+
+    fn on_scope(&self, key: &str) -> bool {
+        match self.scope.drive_uuid() {
+            None => true,
+            Some(d) => self.meta.locations.get(key).is_some_and(|l| l.contains(d)),
+        }
+    }
+
+    fn build_children(&self) -> Vec<Rc<dyn Node>> {
+        let prefix = if self.is_top() {
+            String::new()
+        } else {
+            format!("{}/", self.dir_path)
+        };
+        let mut subdirs: BTreeSet<&str> = BTreeSet::new();
+        let mut direct: Vec<&AnnexedFile> = vec![];
+        let mut seen_keys: HashSet<&str> = HashSet::new();
         for f in &self.meta.files {
-            let Some(locs) = self.meta.locations.get(&f.key) else {
+            if !self.on_scope(&f.key) {
+                continue;
+            }
+            seen_keys.insert(f.key.as_str());
+            let Some(rest) = f.path.strip_prefix(&prefix) else {
                 continue;
             };
-            if !locs.contains(&self.drive_uuid) {
-                continue;
-            }
-            current_keys.insert(f.key.clone());
-            if let Some(slash) = f.path.find('/') {
-                subdirs.insert(f.path[..slash].to_string());
-            } else {
-                direct_files.push(f.clone());
+            match rest.find('/') {
+                Some(slash) => {
+                    subdirs.insert(&rest[..slash]);
+                }
+                None if !rest.is_empty() => direct.push(f),
+                None => {}
             }
         }
-        for sd in subdirs {
-            out.push(Rc::new(DirectoryNode {
-                meta: Rc::clone(&self.meta),
-                dir_path: sd,
-                drive_uuid: Some(self.drive_uuid.clone()),
-                cached_children: std::cell::RefCell::new(None),
-            }) as Rc<dyn Node>);
-        }
-        for f in direct_files {
-            out.push(Rc::new(AnnexFileNode {
-                meta: Rc::clone(&self.meta),
-                file: f.clone(),
-                highlight_drive: Some(self.drive_uuid.clone()),
-            }) as Rc<dyn Node>);
-        }
-
-        // Supplement with unused keys ... (add them as top level or under their dir, for simplicity as top)
-        for (key, locs) in &self.meta.locations {
-            if locs.contains(&self.drive_uuid) && !current_keys.contains(key) {
-                let size = parse_size_from_key(key);
-                let fake = AnnexedFile {
-                    path: format!("<unused key> {}", key),
-                    key: key.clone(),
-                    size,
-                };
-                out.push(Rc::new(AnnexFileNode {
+        let highlight = self.scope.drive_uuid().map(str::to_string);
+        let mut kids: Vec<Rc<dyn Node>> = subdirs
+            .into_iter()
+            .map(|sd| {
+                Rc::new(FileTreeNode {
                     meta: Rc::clone(&self.meta),
-                    file: fake,
-                    highlight_drive: Some(self.drive_uuid.clone()),
-                }) as Rc<dyn Node>);
+                    scope: self.scope.clone(),
+                    dir_path: format!("{prefix}{sd}"),
+                    children: OnceCell::new(),
+                }) as Rc<dyn Node>
+            })
+            .collect();
+        let mut files: Vec<Rc<dyn Node>> = direct
+            .into_iter()
+            .map(|f| {
+                Rc::new(AnnexFileNode {
+                    meta: Rc::clone(&self.meta),
+                    file: f.clone(),
+                    highlight_drive: highlight.clone(),
+                }) as Rc<dyn Node>
+            })
+            .collect();
+        // Keys on the drive with no working-tree path (old versions, unused content).
+        if self.is_top()
+            && let Some(drive) = self.scope.drive_uuid()
+        {
+            for (key, locs) in &self.meta.locations {
+                if locs.contains(drive) && !seen_keys.contains(key.as_str()) {
+                    files.push(Rc::new(AnnexFileNode {
+                        meta: Rc::clone(&self.meta),
+                        file: AnnexedFile {
+                            path: format!("<unused key> {key}"),
+                            key: key.clone(),
+                            size: parse_size_from_key(key),
+                        },
+                        highlight_drive: highlight.clone(),
+                    }));
+                }
             }
         }
+        files.sort_by_cached_key(|n| n.label());
+        kids.extend(files);
+        kids
+    }
+}
 
-        // Sort: dirs first, then files
-        out.sort_by_key(|n| {
-            let is_dir = n.kind() == NodeKind::Dir;
-            (if is_dir { 0 } else { 1 }, n.label())
-        });
-        *cache = Some(out.clone());
-        out
+impl Node for FileTreeNode {
+    fn label(&self) -> String {
+        if !self.is_top() {
+            return dir_label(&self.dir_path);
+        }
+        match &self.scope {
+            TreeScope::All => format!("all annexed files ({})", self.meta.files.len()),
+            TreeScope::Drive(uuid, name) => {
+                let cnt = self
+                    .meta
+                    .locations
+                    .values()
+                    .filter(|s| s.contains(uuid))
+                    .count();
+                format!("files on {name} ({cnt})")
+            }
+        }
+    }
+    fn kind(&self) -> NodeKind {
+        if self.is_top() {
+            NodeKind::Files
+        } else {
+            NodeKind::Dir
+        }
+    }
+    fn children(&self) -> Children {
+        cached(&self.children, || self.build_children())
     }
     fn details(&self) -> Vec<String> {
-        vec![
-            format!("Drive: {} ({})", self.drive_name, self.drive_uuid),
-            "Files whose content is recorded as present on this drive.".into(),
-            "For working tree files the path is shown; unused keys shown with <unused key> prefix."
-                .into(),
-        ]
+        if !self.is_top() {
+            return vec![format!("directory: {}", self.dir_path)];
+        }
+        match &self.scope {
+            TreeScope::All => vec![
+                "All files currently annexed in the working tree.".into(),
+                "Each entry shows locations when descended.".into(),
+                "For very large repos prefer descending into specific drives to filter.".into(),
+            ],
+            TreeScope::Drive(uuid, name) => vec![
+                format!("Drive: {name} ({uuid})"),
+                "Files whose content is recorded as present on this drive.".into(),
+                "For working tree files the path is shown; unused keys shown with <unused key> prefix."
+                    .into(),
+            ],
+        }
     }
+}
+
+/// Details rows for one annexed file: path, key, size and every recorded location.
+pub fn file_details(
+    meta: &AnnexMetadata,
+    file: &AnnexedFile,
+    highlight: Option<&str>,
+) -> Vec<String> {
+    let mut d = vec![format!("path: {}", file.path), format!("key: {}", file.key)];
+    if let Some(s) = file.size {
+        d.push(format!("size: {}", human_bytes(s)));
+    }
+    let mut locs: Vec<&String> = meta
+        .locations
+        .get(&file.key)
+        .map(|l| l.iter().filter(|u| meta.remotes.contains_key(*u)).collect())
+        .unwrap_or_default();
+    if locs.is_empty() {
+        d.push("no location records (perhaps never copied)".into());
+        return d;
+    }
+    locs.sort();
+    d.push(format!("present on {} locations:", locs.len()));
+    for u in locs {
+        let name = crate::annex::short_name(meta, u);
+        let trust = meta
+            .remotes
+            .get(u)
+            .map(|r| r.trust)
+            .unwrap_or(TrustLevel::SemiTrusted);
+        let star = if Some(u.as_str()) == highlight {
+            " ★"
+        } else {
+            ""
+        };
+        d.push(format!("  {} {}{}", name, trust.short(), star));
+    }
+    d
+}
+
+/// Raw location record for the `x` view.
+pub fn file_raw(meta: &AnnexMetadata, file: &AnnexedFile) -> Option<String> {
+    let locs = meta.locations.get(&file.key)?;
+    let mut uuids: Vec<&String> = locs.iter().collect();
+    uuids.sort();
+    let mut s = format!("key: {}\n", file.key);
+    for u in uuids {
+        s.push_str(&format!("  {}\n", u));
+    }
+    Some(s)
 }
 
 /// A single annexed file. Details list all locations.
@@ -877,12 +971,6 @@ pub struct AnnexFileNode {
 impl Node for AnnexFileNode {
     fn label(&self) -> String {
         let sz = self.file.size.map(human_bytes).unwrap_or_default();
-        let _locs = self
-            .meta
-            .locations
-            .get(&self.file.key)
-            .map(|s| s.len())
-            .unwrap_or(0);
         let badge = if let Some(locs) = self.meta.locations.get(&self.file.key) {
             let mut names: Vec<_> = locs
                 .iter()
@@ -908,223 +996,9 @@ impl Node for AnnexFileNode {
         NodeKind::File
     }
     fn details(&self) -> Vec<String> {
-        let mut d = vec![
-            format!("path: {}", self.file.path),
-            format!("key: {}", self.file.key),
-        ];
-        if let Some(s) = self.file.size {
-            d.push(format!("size: {}", human_bytes(s)));
-        }
-        // locations
-        let mut locs: std::collections::HashSet<String> = self
-            .meta
-            .locations
-            .get(&self.file.key)
-            .cloned()
-            .unwrap_or_default();
-        if locs.is_empty() {
-            // Fallback to live query using git annex whereis (the user can see locations
-            // with "git annex whereis", so we should too when the batch pre-load missed it).
-            if let Ok(live) =
-                crate::annex::get_live_locations_for_key(&self.meta.root, &self.file.key)
-            {
-                locs = live;
-            }
-        }
-        locs.retain(|u| self.meta.remotes.contains_key(u));
-        if !locs.is_empty() {
-            d.push(format!("present on {} locations:", locs.len()));
-            let mut sorted: Vec<_> = locs.into_iter().collect();
-            sorted.sort();
-            for u in sorted {
-                let name = crate::annex::short_name(&self.meta, &u);
-                let trust = self
-                    .meta
-                    .remotes
-                    .get(&u)
-                    .map(|r| r.trust)
-                    .unwrap_or(TrustLevel::SemiTrusted);
-                let star = if Some(&u) == self.highlight_drive.as_ref() {
-                    " ★"
-                } else {
-                    ""
-                };
-                d.push(format!("  {} {}{}", name, trust.short(), star));
-            }
-        } else {
-            d.push("no location records (perhaps never copied)".into());
-        }
-        d
+        file_details(&self.meta, &self.file, self.highlight_drive.as_deref())
     }
     fn raw_text(&self) -> Option<String> {
-        // Show the raw location log if we could fetch it, but for now the locations we have
-        if let Some(locs) = self.meta.locations.get(&self.file.key) {
-            let mut s = format!("key: {}\n", self.file.key);
-            for u in locs {
-                s.push_str(&format!("  {}\n", u));
-            }
-            Some(s)
-        } else {
-            None
-        }
-    }
-}
-
-/// Represents a directory in the annexed files tree.
-pub struct DirectoryNode {
-    meta: Rc<AnnexMetadata>,
-    dir_path: String, // e.g. "subdir/example" or "" for top
-    // If set, only include files present on this drive (for per-drive tree views)
-    drive_uuid: Option<String>,
-    cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,
-}
-
-impl Node for DirectoryNode {
-    fn label(&self) -> String {
-        if self.dir_path.is_empty() {
-            "<root>".to_string()
-        } else {
-            format!(
-                "{}/",
-                self.dir_path.rsplit('/').next().unwrap_or(&self.dir_path)
-            )
-        }
-    }
-    fn kind(&self) -> NodeKind {
-        NodeKind::Dir
-    }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut cache = self.cached_children.borrow_mut();
-        if let Some(c) = cache.as_ref() {
-            return c.clone();
-        }
-        let prefix = if self.dir_path.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", self.dir_path)
-        };
-        let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut direct_files: Vec<AnnexedFile> = vec![];
-        for f in &self.meta.files {
-            if !f.path.starts_with(&prefix) {
-                continue;
-            }
-            // If we are in a per-drive tree, only include files present on that drive
-            if let Some(drive) = &self.drive_uuid {
-                if let Some(locs) = self.meta.locations.get(&f.key) {
-                    if !locs.contains(drive) {
-                        continue;
-                    }
-                } else {
-                    continue;
-                }
-            }
-            let rest = &f.path[prefix.len()..];
-            if rest.is_empty() {
-                continue;
-            }
-            if let Some(slash_pos) = rest.find('/') {
-                subdirs.insert(rest[..slash_pos].to_string());
-            } else {
-                direct_files.push(f.clone());
-            }
-        }
-        let mut kids: Vec<Rc<dyn Node>> = vec![];
-        for sd in subdirs {
-            let sub_path = if self.dir_path.is_empty() {
-                sd
-            } else {
-                format!("{}/{}", self.dir_path, sd)
-            };
-            kids.push(Rc::new(DirectoryNode {
-                meta: Rc::clone(&self.meta),
-                dir_path: sub_path,
-                drive_uuid: self.drive_uuid.clone(),
-                cached_children: std::cell::RefCell::new(None),
-            }) as Rc<dyn Node>);
-        }
-        for f in direct_files {
-            kids.push(Rc::new(AnnexFileNode {
-                meta: Rc::clone(&self.meta),
-                file: f,
-                highlight_drive: self.drive_uuid.clone(),
-            }) as Rc<dyn Node>);
-        }
-        kids.sort_by_key(|k| {
-            let is_dir = k.kind() == NodeKind::Dir;
-            (if is_dir { 0 } else { 1 }, k.label())
-        });
-        *cache = Some(kids.clone());
-        kids
-    }
-    fn details(&self) -> Vec<String> {
-        vec![format!(
-            "directory: {}",
-            if self.dir_path.is_empty() {
-                "<root>"
-            } else {
-                &self.dir_path
-            }
-        )]
-    }
-}
-
-/// Flat list of ALL annexed files in working tree (with locations summary).
-pub struct AllFilesNode {
-    pub meta: Rc<AnnexMetadata>,
-    cached_children: std::cell::RefCell<Option<Vec<Rc<dyn Node>>>>,
-}
-
-impl Node for AllFilesNode {
-    fn label(&self) -> String {
-        format!("all annexed files ({})", self.meta.files.len())
-    }
-    fn kind(&self) -> NodeKind {
-        NodeKind::Files
-    }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut cache = self.cached_children.borrow_mut();
-        if let Some(cached) = cache.as_ref() {
-            return cached.clone();
-        }
-        // Build top-level directory tree instead of flat list
-        let mut subdirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut direct_files: Vec<AnnexedFile> = vec![];
-        for f in &self.meta.files {
-            if let Some(slash) = f.path.find('/') {
-                subdirs.insert(f.path[..slash].to_string());
-            } else {
-                direct_files.push(f.clone());
-            }
-        }
-        let mut v: Vec<Rc<dyn Node>> = vec![];
-        for sd in subdirs {
-            v.push(Rc::new(DirectoryNode {
-                meta: Rc::clone(&self.meta),
-                dir_path: sd,
-                drive_uuid: None,
-                cached_children: std::cell::RefCell::new(None),
-            }) as Rc<dyn Node>);
-        }
-        for f in direct_files {
-            v.push(Rc::new(AnnexFileNode {
-                meta: Rc::clone(&self.meta),
-                file: f.clone(),
-                highlight_drive: None,
-            }) as Rc<dyn Node>);
-        }
-        v.sort_by_key(|n| {
-            let is_dir = n.kind() == NodeKind::Dir;
-            (if is_dir { 0 } else { 1 }, n.label())
-        });
-        *cache = Some(v.clone());
-        v
-    }
-    fn details(&self) -> Vec<String> {
-        vec![
-            "All files currently annexed in the working tree.".into(),
-            "Each entry shows locations when descended.".into(),
-            "For very large repos prefer descending into specific drives to filter.".into(),
-        ]
+        file_raw(&self.meta, &self.file)
     }
 }

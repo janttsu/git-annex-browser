@@ -55,7 +55,7 @@ pub struct App {
 
 impl App {
     pub fn new(scan_root: PathBuf) -> Self {
-        let root = Rc::new(RootNode::new(scan_root.clone()));
+        let root = Rc::new(RootNode::new(scan_root.clone(), Rc::from(Vec::new())));
         Self {
             stack: vec![Level {
                 node: root,
@@ -76,7 +76,7 @@ impl App {
     }
 
     /// Build a fresh snapshot-friendly view from current selection path.
-    pub fn snapshot(&self, _page: usize) -> ViewSnapshot {
+    pub fn snapshot(&self) -> ViewSnapshot {
         let level = self.stack.last().unwrap();
         let kids = level.node.children();
         let sel = level.selected.min(kids.len().saturating_sub(1));
@@ -132,15 +132,7 @@ impl App {
             repo_visuals,
             usage,
             status: self.status.clone(),
-            total_repos: if let Some(r) = self.stack.first() {
-                r.node
-                    .children()
-                    .iter()
-                    .filter(|k| k.kind() != NodeKind::Report)
-                    .count()
-            } else {
-                0
-            },
+            total_repos: self.summaries.len(),
             scanning: self.scanning,
         }
     }
@@ -203,7 +195,7 @@ impl App {
                         if let Some(meta) = self.preloaded.get(p).cloned() {
                             // Instant because of bg pre-scan or cache
                             let profiles = Rc::clone(&self.drive_profiles);
-                            let node = Rc::new(RepoNode::new(meta).with_profiles(profiles));
+                            let node = Rc::new(RepoNode::new(meta, profiles));
                             self.stack.push(Level { node, selected: 0 });
                             self.status = "preloaded".into();
                         } else {
@@ -261,7 +253,7 @@ impl App {
         self.ingest_meta(meta);
         let meta = Rc::clone(self.preloaded.get(&root).expect("metadata just ingested"));
         let profiles = Rc::clone(&self.drive_profiles);
-        let node = Rc::new(RepoNode::new(meta).with_profiles(profiles));
+        let node = Rc::new(RepoNode::new(meta, profiles));
         self.stack.push(Level { node, selected: 0 });
         self.status = "loaded".into();
         self.refresh_root_view();
@@ -354,8 +346,7 @@ impl App {
     /// Rebuild/replace the root level node using the current summaries (no downcast).
     pub fn refresh_root_view(&mut self) {
         let prev = self.stack.first().map(|l| l.selected).unwrap_or(0);
-        let mut new_root = RootNode::new(self.root_path.clone());
-        new_root.summaries = self.summaries.clone();
+        let new_root = RootNode::new(self.root_path.clone(), Rc::from(self.summaries.clone()));
         if let Some(lvl) = self.stack.first_mut() {
             lvl.node = Rc::new(new_root);
             let max = lvl.node.children().len().saturating_sub(1);
@@ -385,7 +376,7 @@ impl App {
         let Some(meta) = self.preloaded.get(root).cloned() else {
             return;
         };
-        let node = Rc::new(RepoNode::new(meta).with_profiles(Rc::clone(&self.drive_profiles)));
+        let node = Rc::new(RepoNode::new(meta, Rc::clone(&self.drive_profiles)));
         let first_sel = selections.first().copied().unwrap_or(0);
         self.stack.push(Level {
             node,
