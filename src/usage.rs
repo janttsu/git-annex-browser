@@ -1,9 +1,9 @@
 //! ncdu-style disk usage tree built from git-annex file sizes (not the filesystem).
 
 use crate::annex::{AnnexMetadata, AnnexedFile};
-use crate::node::{Node, NodeKind};
+use crate::node::{Children, Node, NodeKind, file_details, file_raw};
 use crate::util::human_bytes;
-use std::cell::RefCell;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -41,6 +41,10 @@ pub struct UsageTree {
 }
 
 impl UsageTree {
+    pub fn build(files: &[AnnexedFile]) -> Self {
+        build_usage_tree(files)
+    }
+
     pub fn stats(&self, dir: &str) -> (u64, usize) {
         self.totals.get(dir).copied().unwrap_or((0, 0))
     }
@@ -165,17 +169,17 @@ pub struct UsageDirNode {
     meta: Rc<AnnexMetadata>,
     tree: Rc<UsageTree>,
     dir_path: String,
-    cached_children: RefCell<Option<Vec<Rc<dyn Node>>>>,
+    children: OnceCell<Children>,
 }
 
 impl UsageDirNode {
-    pub fn root(meta: Rc<AnnexMetadata>) -> Self {
-        let tree = Rc::new(build_usage_tree(&meta.files));
+    /// Top of the usage tree. `tree` is built once per loaded repo and shared.
+    pub fn root(meta: Rc<AnnexMetadata>, tree: Rc<UsageTree>) -> Self {
         Self {
             meta,
             tree,
             dir_path: String::new(),
-            cached_children: RefCell::new(None),
+            children: OnceCell::new(),
         }
     }
 
@@ -217,39 +221,39 @@ impl Node for UsageDirNode {
     }
     fn initial_selected(&self) -> usize {
         // Skip `..` so the largest child is selected, like ncdu.
-        let n = self.children().len();
-        if n > 1 { 1 } else { 0 }
+        if self.tree.children_sorted(&self.dir_path).is_empty() {
+            0
+        } else {
+            1
+        }
     }
     fn usage_listing(&self) -> Option<UsageListing> {
         Some(self.tree.listing(&self.dir_path))
     }
-    fn children(&self) -> Vec<Rc<dyn Node>> {
-        let mut cache = self.cached_children.borrow_mut();
-        if let Some(c) = cache.as_ref() {
-            return c.clone();
-        }
-        let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(ParentDirNode)];
-        for child in self.tree.children_sorted(&self.dir_path) {
-            if child.is_dir {
-                kids.push(Rc::new(UsageDirNode {
-                    meta: Rc::clone(&self.meta),
-                    tree: Rc::clone(&self.tree),
-                    dir_path: child.rel_path.clone(),
-                    cached_children: RefCell::new(None),
-                }));
-            } else if let Some(idx) = child.file_idx
-                && let Some(f) = self.meta.files.get(idx)
-            {
-                kids.push(Rc::new(UsageFileNode {
-                    meta: Rc::clone(&self.meta),
-                    file: f.clone(),
-                    name: child.name.clone(),
-                    size: child.size,
-                }));
+    fn children(&self) -> Children {
+        Rc::clone(self.children.get_or_init(|| {
+            let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(ParentDirNode)];
+            for child in self.tree.children_sorted(&self.dir_path) {
+                if child.is_dir {
+                    kids.push(Rc::new(UsageDirNode {
+                        meta: Rc::clone(&self.meta),
+                        tree: Rc::clone(&self.tree),
+                        dir_path: child.rel_path.clone(),
+                        children: OnceCell::new(),
+                    }));
+                } else if let Some(idx) = child.file_idx
+                    && let Some(f) = self.meta.files.get(idx)
+                {
+                    kids.push(Rc::new(UsageFileNode {
+                        meta: Rc::clone(&self.meta),
+                        file: f.clone(),
+                        name: child.name.clone(),
+                        size: child.size,
+                    }));
+                }
             }
-        }
-        *cache = Some(kids.clone());
-        kids
+            Rc::from(kids)
+        }))
     }
     fn details(&self) -> Vec<String> {
         let (sz, n) = self.tree.stats(&self.dir_path);
@@ -317,12 +321,7 @@ impl Node for UsageFileNode {
         Some(self.present_here())
     }
     fn details(&self) -> Vec<String> {
-        let mut d = crate::node::AnnexFileNode {
-            meta: Rc::clone(&self.meta),
-            file: self.file.clone(),
-            highlight_drive: None,
-        }
-        .details();
+        let mut d = file_details(&self.meta, &self.file, None);
         if !self.present_here() {
             d.insert(
                 1,
@@ -332,12 +331,7 @@ impl Node for UsageFileNode {
         d
     }
     fn raw_text(&self) -> Option<String> {
-        crate::node::AnnexFileNode {
-            meta: Rc::clone(&self.meta),
-            file: self.file.clone(),
-            highlight_drive: None,
-        }
-        .raw_text()
+        file_raw(&self.meta, &self.file)
     }
 }
 

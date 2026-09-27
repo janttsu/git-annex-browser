@@ -1009,75 +1009,11 @@ fn apply_present_stats(
     }
 }
 
-fn is_secret_remote_key(k: &str) -> bool {
+pub fn is_secret_remote_key(k: &str) -> bool {
     matches!(
         k,
         "cipher" | "embedcreds" | "encryptionkey" | "secret" | "password" | "keyid"
     )
-}
-
-#[derive(Debug, Deserialize)]
-struct WhereisRemoteJson {
-    #[serde(default)]
-    uuid: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct WhereisJson {
-    key: Option<String>,
-    #[serde(default)]
-    whereis: Vec<WhereisRemoteJson>,
-    #[serde(default)]
-    untrusted: Vec<WhereisRemoteJson>,
-}
-
-impl WhereisJson {
-    fn uuids(&self) -> HashSet<String> {
-        self.whereis
-            .iter()
-            .chain(self.untrusted.iter())
-            .map(|r| r.uuid.as_str())
-            .filter(|u| !u.is_empty())
-            .map(|u| u.to_string())
-            .collect()
-    }
-}
-
-fn parse_whereis_json_lines(stdout: &str) -> HashMap<String, HashSet<String>> {
-    let mut locations = HashMap::new();
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Ok(val) = serde_json::from_str::<WhereisJson>(line)
-            && let Some(key) = val.key.clone()
-        {
-            locations.insert(key, val.uuids());
-        }
-    }
-    locations
-}
-
-/// Query live locations for a specific key using git annex whereis --json.
-/// This can be used as fallback when the batch whereis at load time didn't have the record.
-pub fn get_live_locations_for_key(repo: &Path, key: &str) -> Result<HashSet<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("annex")
-        .arg("whereis")
-        .arg("--json")
-        .arg(format!("--key={key}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut present = HashSet::new();
-    for locs in parse_whereis_json_lines(&stdout).into_values() {
-        present.extend(locs);
-    }
-    Ok(present)
 }
 
 /// Parse `git annex find --format='${file}\000${key}\000${bytesize}\000'` output.
@@ -1561,6 +1497,32 @@ impl DriveProfile {
             .max_by_key(|(_, c)| *c)
             .and_then(|(r, _)| r.clone())
     }
+    /// Whether `r` uses the most common trust, groups, wanted and required setup.
+    pub fn matches_common(&self, r: &Remote) -> bool {
+        if let Some(ct) = self.most_common_trust()
+            && r.trust != ct
+        {
+            return false;
+        }
+        if let Some(cg) = self.most_common_groups() {
+            let mut myg = r.groups.clone();
+            myg.sort();
+            if myg != cg {
+                return false;
+            }
+        }
+        if let Some(cw) = self.most_common_wanted()
+            && r.wanted.as_deref() != Some(cw.as_str())
+        {
+            return false;
+        }
+        if let Some(cr) = self.most_common_required()
+            && r.required.as_deref() != Some(cr.as_str())
+        {
+            return false;
+        }
+        true
+    }
     pub fn has_variation(&self) -> bool {
         self.trusts.len() > 1
             || self.group_sets.len() > 1
@@ -1851,15 +1813,6 @@ u2 something else timestamp=9s
             m["u1"].get("cipher").map(String::as_str),
             Some("[redacted]")
         );
-    }
-
-    #[test]
-    fn whereis_json_includes_untrusted() {
-        let line = r#"{"key":"SHA256E-s1--aa","whereis":[{"uuid":"here-uuid"}],"untrusted":[{"uuid":"usb-uuid"}]}"#;
-        let locs = parse_whereis_json_lines(line);
-        let set = locs.get("SHA256E-s1--aa").unwrap();
-        assert!(set.contains("here-uuid"));
-        assert!(set.contains("usb-uuid"));
     }
 
     fn mkdir(p: &Path) {
