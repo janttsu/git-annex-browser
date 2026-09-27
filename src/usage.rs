@@ -1,7 +1,7 @@
 //! ncdu-style disk usage tree built from git-annex file sizes (not the filesystem).
 
 use crate::annex::{AnnexMetadata, AnnexedFile};
-use crate::node::Node;
+use crate::node::{Node, NodeKind};
 use crate::util::human_bytes;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -153,8 +153,8 @@ impl Node for ParentDirNode {
     fn label(&self) -> String {
         "..".into()
     }
-    fn kind(&self) -> &'static str {
-        "parent"
+    fn kind(&self) -> NodeKind {
+        NodeKind::Parent
     }
     fn details(&self) -> Vec<String> {
         vec!["Go up one directory (same as ← / h / Back).".into()]
@@ -200,8 +200,12 @@ impl Node for UsageDirNode {
             )
         }
     }
-    fn kind(&self) -> &'static str {
-        if self.is_root() { "usage" } else { "dir" }
+    fn kind(&self) -> NodeKind {
+        if self.is_root() {
+            NodeKind::Usage
+        } else {
+            NodeKind::Dir
+        }
     }
     fn size(&self) -> Option<u64> {
         // Root is a repo-menu entry; only in-tree rows get ncdu size columns.
@@ -303,8 +307,8 @@ impl Node for UsageFileNode {
     fn label(&self) -> String {
         self.name.clone()
     }
-    fn kind(&self) -> &'static str {
-        "file"
+    fn kind(&self) -> NodeKind {
+        NodeKind::File
     }
     fn size(&self) -> Option<u64> {
         Some(self.size)

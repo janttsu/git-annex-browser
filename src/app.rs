@@ -5,7 +5,7 @@ The heavy data lives on the worker thread.
 */
 
 use crate::annex::{self, AnnexMetadata, RepoSummary, aggregate_remote_usage};
-use crate::node::{Node, RepoLoadingNode, RepoNode, RootNode};
+use crate::node::{Node, NodeKind, RepoLoadingNode, RepoNode, RootNode};
 use crate::usage::UsageListing;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -25,7 +25,6 @@ pub enum Command {
     Back,
     Refresh,
     ToggleHelp,
-    ToggleRaw, // like 'x' for raw log/details
     Select(usize),
     None,
 }
@@ -94,12 +93,13 @@ impl App {
                 });
                 ListItem {
                     label: n.label(),
-                    kind: n.kind().to_string(),
+                    kind: n.kind(),
                     anomalous: n.anomalous(),
                     trust: n.trust(),
                     repo_name,
                     size: n.size(),
                     missing: n.present() == Some(false),
+                    under_copies: n.under_copies(),
                 }
             })
             .collect();
@@ -136,7 +136,7 @@ impl App {
                 r.node
                     .children()
                     .iter()
-                    .filter(|k| k.kind() != "report")
+                    .filter(|k| k.kind() != NodeKind::Report)
                     .count()
             } else {
                 0
@@ -147,7 +147,7 @@ impl App {
 
     pub fn execute(&mut self, cmd: Command, page: usize) -> Result<()> {
         match cmd {
-            Command::None | Command::Quit | Command::ToggleHelp | Command::ToggleRaw => {}
+            Command::None | Command::Quit | Command::ToggleHelp => {}
             Command::Select(i) => {
                 let l = self.current_level_mut();
                 let max = l.node.children().len().saturating_sub(1);
@@ -193,10 +193,9 @@ impl App {
                 let l = self.stack.last().unwrap();
                 let kids = l.node.children();
                 if let Some(child) = kids.get(l.selected)
-                    && child.kind() != "report"
-                    && child.kind() != "viz"
+                    && !child.kind().is_visual()
                 {
-                    if child.kind() == "parent" {
+                    if child.kind() == NodeKind::Parent {
                         if self.stack.len() > 1 {
                             self.stack.pop();
                         }
@@ -362,9 +361,9 @@ impl App {
             let max = lvl.node.children().len().saturating_sub(1);
             lvl.selected = prev.min(max);
         }
-        if self.stack.len() >= 2 && self.stack[1].node.kind() == "report" {
+        if self.stack.len() >= 2 && self.stack[1].node.kind() == NodeKind::Report {
             let kids = self.stack[0].node.children();
-            if let Some(report) = kids.iter().find(|n| n.kind() == "report") {
+            if let Some(report) = kids.iter().find(|n| n.kind() == NodeKind::Report) {
                 let sel = self.stack[1].selected;
                 self.stack[1].node = Rc::clone(report);
                 self.stack[1].selected = sel;
@@ -429,7 +428,7 @@ pub struct ViewSnapshot {
 #[derive(Debug, Clone)]
 pub struct ListItem {
     pub label: String,
-    pub kind: String,
+    pub kind: NodeKind,
     /// True if this drive/repo setup differs from the common setup for drives/repos with the same name/folder.
     pub anomalous: bool,
     pub trust: Option<crate::annex::TrustLevel>,
@@ -439,6 +438,26 @@ pub struct ListItem {
     pub size: Option<u64>,
     /// True when annexed content is not present on this repo.
     pub missing: bool,
+    /// Some keys have fewer counting copies than numcopies.
+    pub under_copies: bool,
+}
+
+/// Case-insensitive match of a list row against the `/` filter.
+/// `filter_lower` must already be lowercase.
+pub fn matches_filter(item: &ListItem, filter_lower: &str) -> bool {
+    filter_lower.is_empty()
+        || item.label.to_lowercase().contains(filter_lower)
+        || item.kind.label().contains(filter_lower)
+}
+
+/// Indices of list rows visible under `filter`.
+pub fn visible_indices(list: &[ListItem], filter: &str) -> Vec<usize> {
+    let f = filter.to_lowercase();
+    list.iter()
+        .enumerate()
+        .filter(|(_, it)| matches_filter(it, &f))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Live dashboard for the global report (bars + copy-health).
@@ -577,7 +596,3 @@ impl VisualRepoDetail {
         }
     }
 }
-
-// Small helper for downcasting Rc<dyn Node> (simple since Rust 1.0 no built-in, use a tiny trick or Any).
-// We use a manual approach with type ids or just match in app. For simplicity here we added a helper in node?
-// Since we control all types, in practice the descend logic above uses concrete check before push.

@@ -27,11 +27,23 @@ pub fn fmt_unix(ts: i64) -> String {
 }
 
 pub fn short_uuid(u: &str) -> String {
-    if u.len() > 8 {
-        format!("{}…", &u[..8])
+    if u.chars().count() > 8 {
+        format!("{}…", u.chars().take(8).collect::<String>())
     } else {
         u.to_string()
     }
+}
+
+/// Keep the end of `s` so it fits in `max` characters, prefixing `...` when cut.
+/// Works on characters, so multi-byte names never split mid-codepoint.
+pub fn truncate_start(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(3);
+    let tail: String = s.chars().skip(count - keep).collect();
+    format!("...{tail}")
 }
 
 pub fn trust_color(trust: crate::annex::TrustLevel) -> ratatui::style::Color {
@@ -42,5 +54,25 @@ pub fn trust_color(trust: crate::annex::TrustLevel) -> ratatui::style::Color {
         SemiTrusted => Color::Yellow,
         UnTrusted => Color::Red,
         Dead => Color::DarkGray,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_start_is_char_safe() {
+        let name = "äöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäöäö";
+        let t = truncate_start(name, 10);
+        assert_eq!(t.chars().count(), 10);
+        assert!(t.starts_with("..."));
+        assert_eq!(truncate_start("short", 10), "short");
+    }
+
+    #[test]
+    fn short_uuid_is_char_safe() {
+        assert_eq!(short_uuid("ääääääääää"), "ääääääää…");
+        assert_eq!(short_uuid("abc"), "abc");
     }
 }
