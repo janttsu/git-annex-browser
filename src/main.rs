@@ -378,6 +378,7 @@ fn run_tui(
     let mut guard = tui::TerminalGuard::new()?;
     let tick = Duration::from_millis(cfg.tick_ms.clamp(10, 1000));
     let mut ui = UiState::default();
+    let mut info = tui::DrawInfo::default();
     let mut dirty = true;
 
     loop {
@@ -387,25 +388,23 @@ fn run_tui(
         }
 
         if dirty {
-            guard.term.draw(|frame| tui::draw(frame, &ui))?;
+            guard.term.draw(|frame| info = tui::draw(frame, &ui))?;
             dirty = false;
         }
 
         if !event::poll(tick)? {
             continue;
         }
-        let key = match event::read()? {
-            Event::Key(key) => key,
-            Event::Resize(..) => {
-                dirty = true;
-                continue;
-            }
+        let page = tui::page_size(&guard.term);
+        let action = match event::read()? {
+            Event::Key(key) => ui.handle_key(key, page),
+            Event::Mouse(m) => ui.handle_mouse(m, &info, page),
+            Event::Resize(..) => UiAction::None,
             _ => continue,
         };
         dirty = true;
 
-        let page = tui::page_size(&guard.term);
-        match ui.handle_key(key, page) {
+        match action {
             UiAction::None => {}
             UiAction::Quit => return Ok(()),
             UiAction::Send(cmd) => {

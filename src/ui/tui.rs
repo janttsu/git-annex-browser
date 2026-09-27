@@ -11,6 +11,7 @@ use crate::usage::UsageListing;
 use crate::util::human_bytes;
 use crossterm::{
     cursor::{Hide, Show},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{
         Clear as CrosstermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -29,6 +30,16 @@ use std::{
     io::{Result as IoResult, Stdout, stdout},
     panic,
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Where the list was drawn, for mapping mouse clicks to rows.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DrawInfo {
+    /// List widget area including its border.
+    pub list_area: Option<Rect>,
+    /// Index of the first visible row among the filtered rows.
+    pub list_offset: usize,
+}
 
 static HELP_TEXT: &str = r#"
   ↑ / k          up
@@ -65,7 +76,7 @@ impl TerminalGuard {
     pub fn new() -> IoResult<Self> {
         panic::set_hook(Box::new(|info| {
             let _ = disable_raw_mode();
-            let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
             eprintln!("panic: {}", info);
         }));
         enable_raw_mode()?;
@@ -73,6 +84,7 @@ impl TerminalGuard {
         execute!(
             out,
             EnterAlternateScreen,
+            EnableMouseCapture,
             CrosstermClear(ClearType::All),
             Hide
         )?;
@@ -85,7 +97,7 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
     }
 }
 
@@ -97,7 +109,8 @@ pub fn page_size(term: &Terminal<CrosstermBackend<Stdout>>) -> usize {
         .max(1)
 }
 
-pub fn draw(frame: &mut Frame, ui: &UiState) {
+pub fn draw(frame: &mut Frame, ui: &UiState) -> DrawInfo {
+    let mut info = DrawInfo::default();
     // Clear the screen on every frame to prevent old terminal content from showing through.
     frame.render_widget(Clear, frame.area());
 
@@ -108,7 +121,7 @@ pub fn draw(frame: &mut Frame, ui: &UiState) {
                 .title(" git-annex-browser "),
         );
         frame.render_widget(msg, centered_rect(40, 3, frame.area()));
-        return;
+        return info;
     };
 
     if ui.show_help {
@@ -116,7 +129,7 @@ pub fn draw(frame: &mut Frame, ui: &UiState) {
             .block(Block::default().borders(Borders::ALL).title(" help "))
             .wrap(Wrap { trim: true });
         frame.render_widget(p, centered_rect(70, 26, frame.area()));
-        return;
+        return info;
     }
 
     let [crumb_area, main_area, status_area] = Layout::vertical([
@@ -139,7 +152,8 @@ pub fn draw(frame: &mut Frame, ui: &UiState) {
             [Constraint::Percentage(38), Constraint::Percentage(62)]
         })
         .areas(main_area);
-        render_list(frame, list_area, snap, &ui.filter);
+        info.list_offset = render_list(frame, list_area, snap, &ui.filter);
+        info.list_area = Some(list_area);
         render_details(
             frame,
             detail_area,
@@ -150,6 +164,7 @@ pub fn draw(frame: &mut Frame, ui: &UiState) {
         );
     }
     render_status(frame, status_area, snap, ui);
+    info
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -189,7 +204,8 @@ fn kind_style(kind: NodeKind) -> Style {
     }
 }
 
-fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str) {
+/// Returns the scroll offset ratatui chose, for mapping clicks to rows.
+fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str) -> usize {
     let f = filter.to_lowercase();
     let visible: Vec<(usize, &crate::app::ListItem)> = snap
         .list
@@ -269,6 +285,7 @@ fn render_list(frame: &mut Frame, area: Rect, snap: &ViewSnapshot, filter: &str)
     let mut state = ListState::default();
     state.select(selected_vis);
     frame.render_stateful_widget(list, area, &mut state);
+    state.offset()
 }
 
 fn selected_kind(snap: &ViewSnapshot) -> Option<NodeKind> {
@@ -378,7 +395,7 @@ fn status_line(snap: &ViewSnapshot, ui: &UiState, width: usize) -> String {
     let mut line = head;
     for part in optional {
         let candidate = format!("{line}  •  {part}");
-        if candidate.chars().count() > width {
+        if candidate.width() > width {
             break;
         }
         line = candidate;
@@ -457,14 +474,31 @@ fn copy_mini(repo: &VisualRepo, width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// Fit `name` into exactly `width` terminal columns: cut with `…` or pad with spaces.
+/// Measures display width, so CJK and emoji names keep the columns aligned.
 fn trunc_name(name: &str, width: usize) -> String {
-    if name.chars().count() <= width {
-        format!("{name:<width$}")
+    let mut out = String::new();
+    let mut used = 0;
+    if name.width() <= width {
+        out.push_str(name);
+        used = name.width();
     } else {
-        let mut s: String = name.chars().take(width.saturating_sub(1)).collect();
-        s.push('…');
-        format!("{s:<width$}")
+        let budget = width.saturating_sub(1);
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            out.push(c);
+            used += w;
+        }
+        if width > 0 {
+            out.push('…');
+            used += 1;
+        }
     }
+    out.push_str(&" ".repeat(width.saturating_sub(used)));
+    out
 }
 
 pub fn detail_scroll_rows(snap: &ViewSnapshot) -> usize {

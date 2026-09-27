@@ -372,6 +372,111 @@ impl AnnexMetadata {
         }
     }
 
+    pub fn wanted_copies(&self) -> usize {
+        self.numcopies.unwrap_or(1).max(1) as usize
+    }
+
+    /// Copies of `key` that count toward numcopies (untrusted and dead remotes do not).
+    pub fn counting_copies(&self, key: &str) -> usize {
+        self.locations.get(key).map_or(0, |s| {
+            s.iter()
+                .filter(|u| counts_toward_numcopies(&self.remotes, u))
+                .count()
+        })
+    }
+
+    /// Working-tree files with fewer counting copies than numcopies, fewest copies first.
+    pub fn at_risk_files(&self) -> Vec<(&AnnexedFile, usize)> {
+        let want = self.wanted_copies();
+        let mut v: Vec<_> = self
+            .files
+            .iter()
+            .map(|f| (f, self.counting_copies(&f.key)))
+            .filter(|(_, n)| *n < want)
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
+        v
+    }
+
+    /// Which remotes to connect to get every working-tree file that is not present here.
+    ///
+    /// Greedy set cover by bytes. Local drives (other clones) are tried first, then
+    /// special remotes such as cloud storage, and untrusted remotes (e.g. Glacier) last.
+    pub fn fetch_plan(&self) -> FetchPlan {
+        // Distinct missing keys with the remotes that hold them.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut missing: Vec<(u64, Vec<&str>)> = Vec::new();
+        for f in &self.files {
+            if !seen.insert(&f.key) {
+                continue;
+            }
+            let locs = self.locations.get(&f.key);
+            if locs.is_some_and(|s| s.contains(self.uuid.as_str())) {
+                continue;
+            }
+            let holders: Vec<&str> = locs
+                .into_iter()
+                .flatten()
+                .map(|u| &**u)
+                .filter(|u| self.remotes.contains_key(*u))
+                .collect();
+            missing.push((f.size.unwrap_or(0), holders));
+        }
+        let mut plan = FetchPlan {
+            missing_keys: missing.len(),
+            missing_bytes: missing.iter().map(|(sz, _)| sz).sum(),
+            ..Default::default()
+        };
+
+        // Running (bytes, keys) each remote would still add, and which keys it holds.
+        let mut totals: HashMap<&str, (u64, usize)> = HashMap::new();
+        let mut by_remote: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (sz, holders)) in missing.iter().enumerate() {
+            for u in holders {
+                let t = totals.entry(u).or_default();
+                t.0 += sz;
+                t.1 += 1;
+                by_remote.entry(u).or_default().push(i);
+            }
+        }
+        let mut covered = vec![false; missing.len()];
+        loop {
+            let best = totals
+                .iter()
+                .filter(|(_, (_, keys))| *keys > 0)
+                .max_by(|a, b| {
+                    // Higher is better: local drives, then special remotes, untrusted last.
+                    let pref = |u: &str| match self.remotes.get(u) {
+                        Some(r) if r.trust == TrustLevel::UnTrusted => 0,
+                        Some(r) if r.is_special() => 1,
+                        Some(_) => 2,
+                        None => 0,
+                    };
+                    (pref(a.0), a.1.0, a.1.1)
+                        .cmp(&(pref(b.0), b.1.0, b.1.1))
+                        .then_with(|| b.0.cmp(a.0))
+                })
+                .map(|(u, t)| (*u, *t));
+            let Some((uuid, (bytes, keys))) = best else {
+                break;
+            };
+            plan.steps.push((uuid.to_string(), keys, bytes));
+            for &i in &by_remote[uuid] {
+                if std::mem::replace(&mut covered[i], true) {
+                    continue;
+                }
+                let (sz, holders) = &missing[i];
+                for u in holders {
+                    let t = totals.get_mut(u).expect("holder counted");
+                    t.0 -= sz;
+                    t.1 -= 1;
+                }
+            }
+        }
+        plan.unavailable_keys = covered.iter().filter(|c| !**c).count();
+        plan
+    }
+
     /// Point each file's key at the matching location-log key, so a key
     /// listed by `git annex find` is not stored twice.
     pub fn share_file_keys(&mut self) {
@@ -422,6 +527,18 @@ impl AnnexMetadata {
             apply_present_stats(&mut self.remotes, &self.locations, &key_sizes);
         }
     }
+}
+
+/// Result of `AnnexMetadata::fetch_plan`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct FetchPlan {
+    /// Distinct keys of working-tree files not present here.
+    pub missing_keys: usize,
+    pub missing_bytes: u64,
+    /// Remotes to connect, in order: (uuid, keys it adds, bytes it adds).
+    pub steps: Vec<(String, usize, u64)>,
+    /// Keys with no recorded copy on any known remote.
+    pub unavailable_keys: usize,
 }
 
 /// Aggregate occupancy by remote name across many repos (same drive in several annexes).
@@ -2104,6 +2221,49 @@ u2 something else timestamp=9s
         meta.ensure_sizes();
         assert!(!meta.remotes.contains_key("dead-box"));
         assert_eq!(meta.consumed_size, 20);
+    }
+
+    #[test]
+    fn at_risk_files_sorted_by_fewest_counting_copies() {
+        let m = crate::testutil::sample_meta();
+        let risk: Vec<(&str, usize)> = m
+            .at_risk_files()
+            .into_iter()
+            .map(|(f, n)| (f.path.as_str(), n))
+            .collect();
+        assert_eq!(
+            risk,
+            vec![
+                ("2023/d.jpg", 0),
+                ("2024/b.jpg", 1),
+                ("2024/raw/c.cr2", 1),
+                ("notes.txt", 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_plan_prefers_trusted_drives_then_untrusted() {
+        let m = crate::testutil::sample_meta();
+        let plan = m.fetch_plan();
+        assert_eq!(plan.missing_keys, 3);
+        assert_eq!(plan.missing_bytes, 5060);
+        assert_eq!(
+            plan.steps,
+            vec![("usb".to_string(), 2, 5010), ("glacier".to_string(), 1, 50)]
+        );
+        assert_eq!(plan.unavailable_keys, 0);
+
+        // A cloud remote holding everything still comes after the local drive.
+        let mut m = m;
+        let mut cloud = crate::testutil::remote("cloud", "cloud", TrustLevel::SemiTrusted);
+        cloud.config.insert("type".into(), "external".into());
+        m.remotes.insert("cloud".into(), cloud);
+        for locs in m.locations.values_mut() {
+            locs.insert(Shared::from("cloud"));
+        }
+        let steps: Vec<String> = m.fetch_plan().steps.into_iter().map(|s| s.0).collect();
+        assert_eq!(steps, vec!["usb", "cloud"]);
     }
 
     #[test]
