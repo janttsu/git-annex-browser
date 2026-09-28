@@ -25,7 +25,7 @@ Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group
 - Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees). Refs are read from disk, so plain git repos cost no extra process.
 - Per-repo view of:
   - Summary (uuid, counts, trust breakdown, last fsck)
-  - **Drives / remotes** list with type, trust (`T`/`?`/`U`, colored), present key counts, last fsck. Remotes marked `git annex dead` are omitted.
+  - **Drives / remotes** list with type, trust (`T`/`?`/`U`, colored), present key counts, last fsck, sorted by most recent fsck. A drive is shown in red when its trust, groups, wanted or required setting differs from the same-named drive in most other repos. Remotes marked `git annex dead` are omitted.
   - Files present on a specific drive (including here), from cached location data so offline drives stay browsable
   - All annexed files in the working tree, each annotated with short presence badges
   - **Disk usage** (ncdu-style): directories and files sorted largest-first, with size bars. Sizes are from git-annex keys, so this works when content is not present here
@@ -70,16 +70,16 @@ Keys:
 PgUp / PgDn    page list
 g / G          top / bottom (also Home / End)
 → / Enter / l  descend
-← / h / Back   back
+← / h / Bksp   back
 Esc            close zoom / filter, else back (never quits)
 Shift+PgUp/Dn  scroll details pane (also J / K, Ctrl+d / Ctrl+u)
-/              filter current list (Enter to keep, Esc to clear)
+/              filter current list (Enter to keep, Esc to clear, Ctrl+u to empty)
 s              sort repos: name → size → copy health → file count
 r / F5         refresh: re-discover and reload every repo
 x              raw view (file locations; tab-separated listing in disk usage)
 z              zoom the visual to full screen
 ? / F1         help (any key closes it)
-q              quit
+q / Ctrl+c     quit
 mouse          wheel scrolls; click selects; click the selected row to open it
 ```
 
@@ -137,7 +137,7 @@ git-annex-browser --dump --json --quiet /path/with/annexes | jq '.repos[] | {nam
 
 ### Prebuilt binaries
 
-Tagged releases (`v*`) attach Linux and macOS binaries with SHA-256 checksums to the GitHub release.
+There is no release yet, and the crate is not on crates.io. Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds Linux (x86_64, aarch64) and macOS (x86_64, arm64) binaries and attaches them with SHA-256 checksums to a GitHub release.
 
 ## Screenshots
 
@@ -145,13 +145,26 @@ The images above are real screens from a throwaway Arch Linux VM, not mock-ups. 
 
 ```sh
 scripts/screenshots/run.sh            # writes assets/*-view.png
+scripts/screenshots/run.sh /tmp/shots # writes somewhere else to compare first
+KEEP_VM=1 scripts/screenshots/run.sh  # leave the VM running for inspection over ssh
 ```
 
-It needs `qemu-system-x86_64` with KVM, `qemu-img`, `xorriso`, `ssh` and `python3`. The Arch cloud image is cached in `~/.cache/git-annex-browser-vm/` and checked against the official SHA-256. Set `IMAGE_URL` or `PACMAN_MIRROR` to use a faster mirror.
+It needs `qemu-system-x86_64` with KVM, `qemu-img`, `xorriso`, `ssh` and `python3`. The Arch cloud image (about 560 MB) is cached in `~/.cache/git-annex-browser-vm/` and checked against the official SHA-256. It is never modified, because the VM runs on a temporary overlay disk. The VM also downloads about 1 GB of packages, so a run takes roughly ten minutes on a slow connection. Set `IMAGE_URL` or `PACMAN_MIRROR` to use a faster mirror.
+
+## Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+Some tests create real annexes and need `git-annex` installed. Locally they are skipped when it is missing. In CI they fail instead, so they cannot pass silently. CI also builds with the minimum supported Rust (1.89) and runs `cargo audit`.
 
 ## Notes
 - View only: no `git annex get` / `drop` / `trust`.
 - Nested annexes inside another annex working tree are not discovered (the parent annex is a prune point).
+- Discovery skips `target` and `node_modules` directories, and hidden directories more than two levels below `DIR`.
 - Very large annexes (>50k files) build the file tree when you first open "disk usage", "all files", or a drive's file list; it is kept while the repo stays open.
 - Disk usage counts each path's annex size (like ncdu apparent size). Content does not need to exist on this clone.
 - Drive file lists use cached location-log data, not a live `git annex list`.
