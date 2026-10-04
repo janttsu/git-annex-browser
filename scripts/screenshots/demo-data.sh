@@ -114,8 +114,8 @@ mkfile "2024/summer/lake.mp4" 61440
 mkfile "2024/summer/sauna.mp4" 38912
 mkfile "2024/wedding/ceremony.mp4" 90112
 mkfile "2024/wedding/speeches.mp4" 51200
-mkfile "2025/lapland/aurora.mov" 71680
-mkfile "2025/lapland/husky-ride.mov" 45056
+mkfile "2025/roadtrip/aurora.mov" 71680
+mkfile "2025/roadtrip/coastline.mov" 45056
 mkfile "2026/drone/archipelago.mp4" 66560
 git annex add -q . && git commit -q -m "videos"
 attach videos
@@ -129,7 +129,7 @@ fsck_everywhere videos
 
 ### music: numcopies 1; usb-archive left semitrusted here, so it differs from the other repos
 new_repo music 1
-for a in "Aurora Borealis" "Kalevala Beats" "Midnight Sun" "Northern Lights Trio"; do
+for a in "Aurora Borealis" "Harbor Lights" "Midnight Sun" "Northern Lights Trio"; do
     for t in 1 2 3 4 5 6; do
         mkfile "$a/0$t - track $t.flac" $((5200 + RANDOM % 4000))
     done
@@ -137,7 +137,7 @@ done
 git annex add -q . && git commit -q -m "music"
 attach music
 git annex semitrust usb-archive >/dev/null 2>&1
-git annex copy -q --to usb-archive "Aurora Borealis" "Kalevala Beats"
+git annex copy -q --to usb-archive "Aurora Borealis" "Harbor Lights"
 git annex copy -q --to nas .
 sync_all
 fsck_everywhere music

@@ -2076,7 +2076,7 @@ u2 something else timestamp=9s
         }
         let (unique, summed) = remote_name_stats(&[
             summary(vec![usage("usb-a"), usage("laptop")]),
-            summary(vec![usage("usb-a"), usage("usb")]),
+            summary(vec![usage("usb-a"), usage("usb-b")]),
         ]);
         assert_eq!(unique, 3);
         assert_eq!(summed, 4);

@@ -11,8 +11,8 @@ Rivinumerot viittaavat yllä mainittuun commitiin.
 ## Toteutustila (päivitetty 2026-09-27)
 
 Kaikki alla luetellut kohdat on toteutettu haarassa `worktree-improvements-doc`.
-Testejä on nyt 63, kun alussa niitä oli 29. Clippy on puhdas. Mittaukset on tehty tämän
-koneen 11 oikealla annexilla väliaikaista välimuistia vasten.
+Testejä on nyt 63, kun alussa niitä oli 29. Clippy on puhdas. Mittaukset on tehty
+samalla testikokoelmalla väliaikaista välimuistia vasten.
 
 | Kohta | Tila | Huomio |
 |------|------|--------|
