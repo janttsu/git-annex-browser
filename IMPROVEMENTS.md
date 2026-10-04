@@ -22,9 +22,9 @@ samalla testikokoelmalla väliaikaista välimuistia vasten.
 | 1.4 turha piirto | tehty | Piirretään vain viestin, näppäimen, hiiren tai koon muutoksen jälkeen. |
 | 1.5 `git rev-parse` jokaiselle repolle | tehty | Refit luetaan levyltä; `--max-depth` ja `--one-file-system` lisätty. |
 | 1.6 ~14 git-prosessia per repo | tehty | Nyt noin 4. Lämpimällä levyvälimuistilla aika ei muuttunut (git annex find hallitsee); hyöty näkyy hitailla levyillä. |
-| 2.1 koko välimuisti joka tallennuksella | tehty, poikkeama | Yksi JSON-tiedosto per repo + indeksi. Binääriformaattia (postcard/zstd) ei otettu: jako per repo poisti kustannuksen ja JSON pysyy luettavana. Koko 30 MB → 22 MB. |
+| 2.1 koko välimuisti joka tallennuksella | tehty, poikkeama | Yksi JSON-tiedosto per repo + indeksi. Binääriformaattia (postcard/zstd) ei otettu: jako per repo poisti kustannuksen ja JSON pysyy luettavana. Koko pieneni noin neljänneksen. |
 | 2.2 `Rc` → `Arc` | tehty | |
-| 2.3 turha uudelleenhydratointi | tehty | Sormenjälki: git-annex-haara, HEAD ja configin mtime. Toistuva `--scan`: 54 s → 1 s. |
+| 2.3 turha uudelleenhydratointi | tehty | Sormenjälki: git-annex-haara, HEAD ja configin mtime. Toistuva `--scan` valmistuu sekunnissa, kun aiemmin se kesti lähes minuutin. |
 | 2.4 poistuneet repot | tehty | Näytetään "not found since …"; `--prune` poistaa. |
 | 3.1 tyhjä metadata | tehty | |
 | 3.2 UTF-8-paniikki | tehty | |
@@ -32,7 +32,7 @@ samalla testikokoelmalla väliaikaista välimuistia vasten.
 | 3.4 taustapäivitys hylätään | tehty, tarkennus | Tarkemmin katsottuna Nav-vastaus sisältää aina uusimman tilan, joten tietoa ei hävinnyt. Status ja skannaustila kopioidaan silti heti. |
 | 3.5 statusrivi | tehty | Vihjeet pudotetaan leveyden mukaan; "hex-ish" korjattu. |
 | 3.6 suodatin kahdessa paikassa | tehty | |
-| 4.1 uuid-kopiot | tehty, poikkeama | `Arc<str>`-internointi deserialisoinnin aikana indeksitaulukon sijaan. `--dump` huippumuisti 55 → 36 MiB. |
+| 4.1 uuid-kopiot | tehty, poikkeama | `Arc<str>`-internointi deserialisoinnin aikana indeksitaulukon sijaan. `--dump`-ajon huippumuisti pieneni noin kolmanneksen. |
 | 5.1 toisto | tehty | Kolme hakemistopuuta yhdeksi, yhteinen lokiparseri, `Remote::new`, `RepoSummary::placeholder`, yhteinen `scan`-moduuli. |
 | 5.2 `NodeKind` | tehty | |
 | 5.3 `UiState` | tehty | Näppäin- ja hiirikäsittely testataan ilman terminaalia. |
@@ -344,8 +344,8 @@ kerran.
 ### 4.1 UUID-merkkijonot monistetaan jokaiseen avaimeen
 
 **Havainto.** `AnnexMetadata.locations: HashMap<String, HashSet<String>>`
-(`annex.rs:142`). Testikokoelmalla 300 000 uuid-viittausta × 36 tavua + `String`- ja
-`HashSet`-ylimäärä ≈ 30–40 MB pelkkiä uuid-kopioita. Sama tieto on
+(`annex.rs:142`). Satoja tuhansia uuid-viittauksia × 36 tavua + `String`- ja
+`HashSet`-ylimäärä on kymmeniä megatavuja pelkkiä uuid-kopioita. Sama tieto on
 `Remote`-mapissa kerran.
 
 **Toteutus.**
