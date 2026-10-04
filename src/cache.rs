@@ -492,8 +492,8 @@ mod tests {
     #[test]
     fn repo_file_names_are_stable() {
         assert_eq!(
-            repo_file_name(Path::new("/mnt/hdd/root/movies-annex")),
-            repo_file_name(Path::new("/mnt/hdd/root/movies-annex"))
+            repo_file_name(Path::new("/data/media/movies-annex")),
+            repo_file_name(Path::new("/data/media/movies-annex"))
         );
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);

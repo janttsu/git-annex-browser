@@ -3,16 +3,16 @@
 Katselmoitu 2026-09-27 commitista `8d2e865`. Koko lähdekoodi (n. 6 200 riviä Rustia,
 7 moduulia) luettiin läpi, `cargo clippy -D warnings` on puhdas ja kaikki 29 testiä
 menevät läpi. Havainnot perustuvat koodin lukemiseen, ei profilointiin, ellei toisin
-mainita. Mittapisteenä käytetty tämän koneen välimuisti: 11 repoa, 30 MB `cache.json`,
-76 000 sijaintiavainta, 59 000 tiedostoa, 300 000 uuid-viittausta.
+mainita. Mittapisteenä käytettiin keskikokoista testikokoelmaa: kymmenkunta repoa,
+kymmeniä tuhansia tiedostoja ja satoja tuhansia sijaintimerkintöjä.
 
 Rivinumerot viittaavat yllä mainittuun commitiin.
 
 ## Toteutustila (päivitetty 2026-09-27)
 
 Kaikki alla luetellut kohdat on toteutettu haarassa `worktree-improvements-doc`.
-Testejä on nyt 63, kun alussa niitä oli 29. Clippy on puhdas. Mittaukset on tehty tämän
-koneen 11 oikealla annexilla väliaikaista välimuistia vasten.
+Testejä on nyt 63, kun alussa niitä oli 29. Clippy on puhdas. Mittaukset on tehty
+samalla testikokoelmalla väliaikaista välimuistia vasten.
 
 | Kohta | Tila | Huomio |
 |------|------|--------|
@@ -191,7 +191,7 @@ enemmän.
 serialisoidaan → kirjoitetaan. Skannauksen aikana `persist_preloaded` kutsutaan 4
 sekunnin välein (`worker.rs:143-147`) ja jokaisella kerralla kaikki `preloaded`-
 metadatat kloonataan (`v.as_ref().clone()`, `worker.rs:255`) ja `redact_meta`
-kloonaa ne vielä kerran. Tällä koneella tiedosto on 30 MB ja skaalautuu
+kloonaa ne vielä kerran. Testikokoelmalla tiedosto on kymmeniä megatavuja ja skaalautuu
 lineaarisesti avainten määrän mukaan; miljoonan avaimen annexeilla puhutaan
 sadoista megatavuista, jotka parsitaan ja kirjoitetaan työntekijäsäikeessä
 useita kertoja skannauksen aikana. UI näyttää sen ajan `[busy]`.
@@ -344,7 +344,7 @@ kerran.
 ### 4.1 UUID-merkkijonot monistetaan jokaiseen avaimeen
 
 **Havainto.** `AnnexMetadata.locations: HashMap<String, HashSet<String>>`
-(`annex.rs:142`). Tällä koneella 300 000 uuid-viittausta × 36 tavua + `String`- ja
+(`annex.rs:142`). Testikokoelmalla 300 000 uuid-viittausta × 36 tavua + `String`- ja
 `HashSet`-ylimäärä ≈ 30–40 MB pelkkiä uuid-kopioita. Sama tieto on
 `Remote`-mapissa kerran.
 

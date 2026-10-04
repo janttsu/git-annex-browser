@@ -272,7 +272,7 @@ pub struct RepoSummary {
     /// Clean name for display, preferably the directory basename (e.g. "my-repo")
     #[serde(default)]
     pub name: String,
-    /// The annex internal description (often "orca" or similar on your machines)
+    /// The annex internal description (e.g. "laptop")
     #[serde(default)]
     pub annex_description: String,
     pub file_count: usize,
@@ -2040,17 +2040,17 @@ u2 something else timestamp=9s
         }
         let rows = aggregate_remote_usage(&[
             summary(vec![
-                usage("orca", 1000, 2, None),
-                usage("hetzner", 500, 1, Some("rclone")),
+                usage("laptop", 1000, 2, None),
+                usage("cloud", 500, 1, Some("rclone")),
             ]),
             summary(vec![
-                usage("orca", 250, 3, None),
-                usage("hetzner", 50, 1, Some("rclone")),
+                usage("laptop", 250, 3, None),
+                usage("cloud", 50, 1, Some("rclone")),
                 usage("web", 10, 1, Some("web")),
             ]),
             summary(vec![usage("empty", 0, 0, Some("rclone"))]),
         ]);
-        assert_eq!(rows[0], ("hetzner (rclone)".into(), 550, 2, 2));
+        assert_eq!(rows[0], ("cloud (rclone)".into(), 550, 2, 2));
         assert_eq!(rows[1], ("web (web)".into(), 10, 1, 1));
         assert_eq!(rows.len(), 2);
     }
@@ -2075,8 +2075,8 @@ u2 something else timestamp=9s
             }
         }
         let (unique, summed) = remote_name_stats(&[
-            summary(vec![usage("hdd-sata-02"), usage("orca")]),
-            summary(vec![usage("hdd-sata-02"), usage("usb")]),
+            summary(vec![usage("usb-a"), usage("laptop")]),
+            summary(vec![usage("usb-a"), usage("usb-b")]),
         ]);
         assert_eq!(unique, 3);
         assert_eq!(summed, 4);
