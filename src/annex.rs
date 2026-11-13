@@ -231,6 +231,11 @@ pub struct AnnexedFile {
     pub key: Shared,
     /// Extracted size from key if E-style (e.g. SHA256E-s12345-...)
     pub size: Option<u64>,
+    /// Copies required for this path: max(numcopies, mincopies), including
+    /// per-path values from `.gitattributes`. 0 means "use the repo default"
+    /// (old cache files).
+    #[serde(default)]
+    pub copies_wanted: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,7 +258,10 @@ pub struct AnnexMetadata {
     pub files: Vec<AnnexedFile>,
     /// total keys known (from location logs)
     pub total_keys: usize,
-    /// Sum of sizes of all unique keys (deduplicated size)
+    /// Sum of sizes of current working-tree keys (one copy each).
+    #[serde(default)]
+    pub tree_unique_size: u64,
+    /// Sum of sizes of every key in the location logs (includes old versions).
     #[serde(default)]
     pub unique_size: u64,
     /// Total storage consumed across all drives (size × number of copies)
@@ -340,9 +348,7 @@ impl AnnexMetadata {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.description.clone());
-        let want = self.numcopies.unwrap_or(1).max(1);
-        let (keys_under, keys_ok, keys_over) =
-            copy_health_counts(&self.locations, want, &self.remotes);
+        let (keys_under, keys_ok, keys_over) = self.file_copy_health();
         RepoSummary {
             root: self.root.clone(),
             uuid: self.uuid.clone(),
@@ -365,7 +371,7 @@ impl AnnexMetadata {
                 })
                 .collect(),
             numcopies: self.numcopies,
-            keys_tracked: self.locations.len(),
+            keys_tracked: self.files.len(),
             keys_under,
             keys_ok,
             keys_over,
@@ -385,14 +391,42 @@ impl AnnexMetadata {
         })
     }
 
-    /// Working-tree files with fewer counting copies than numcopies, fewest copies first.
+    /// Copies required for this file. A stored 0 means the repo default
+    /// (cache files written before per-path requirements were recorded).
+    pub fn copies_required(&self, file: &AnnexedFile) -> u32 {
+        if file.copies_wanted == 0 {
+            self.wanted_copies() as u32
+        } else {
+            file.copies_wanted
+        }
+    }
+
+    /// Working-tree files below, at, and above their own required copy count.
+    pub fn file_copy_health(&self) -> (usize, usize, usize) {
+        let mut under = 0;
+        let mut ok = 0;
+        let mut over = 0;
+        for f in &self.files {
+            let have = self.counting_copies(&f.key) as u32;
+            let want = self.copies_required(f);
+            if have < want {
+                under += 1;
+            } else if have == want {
+                ok += 1;
+            } else {
+                over += 1;
+            }
+        }
+        (under, ok, over)
+    }
+
+    /// Working-tree files with fewer counting copies than they require, fewest first.
     pub fn at_risk_files(&self) -> Vec<(&AnnexedFile, usize)> {
-        let want = self.wanted_copies();
         let mut v: Vec<_> = self
             .files
             .iter()
             .map(|f| (f, self.counting_copies(&f.key)))
-            .filter(|(_, n)| *n < want)
+            .filter(|(f, n)| *n < self.copies_required(f) as usize)
             .collect();
         v.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.path.cmp(&b.0.path)));
         v
@@ -500,6 +534,7 @@ impl AnnexMetadata {
         let key_sizes = collect_key_sizes(&self.files, &self.locations);
         apply_present_stats(&mut self.remotes, &self.locations, &key_sizes);
         let (unique_size, consumed_size) = size_totals(&self.locations, &key_sizes);
+        self.tree_unique_size = tree_unique_size(&self.files);
         self.unique_size = unique_size;
         self.consumed_size = consumed_size;
         self.total_keys = self.locations.len().max(self.files.len());
@@ -514,6 +549,9 @@ impl AnnexMetadata {
             .remotes
             .values()
             .any(|r| r.present_count > 0 && r.present_size == 0);
+        if self.tree_unique_size == 0 && !self.files.is_empty() {
+            self.tree_unique_size = tree_unique_size(&self.files);
+        }
         if !need_totals && !need_remote {
             return;
         }
@@ -574,7 +612,8 @@ pub fn aggregate_remote_usage(summaries: &[RepoSummary]) -> Vec<(String, u64, us
 /// Count keys below / at / above the desired number of copies.
 /// Untrusted and dead remotes are omitted — git-annex `numcopies` does the same
 /// (Glacier etc. store bytes but do not satisfy the copy requirement).
-pub fn copy_health_counts(
+#[cfg(test)]
+fn copy_health_counts(
     locations: &Locations,
     numcopies: u32,
     remotes: &HashMap<String, Remote>,
@@ -765,7 +804,8 @@ pub struct RepoFingerprint {
     pub annex_branch: String,
     /// Commit of `HEAD` (the annexed file list). Empty on an unborn branch.
     pub head: String,
-    /// Newest mtime of `.git/config` and `.gitattributes` (numcopies, annex.* settings).
+    /// Newest mtime, in nanoseconds, of git config and every `.gitattributes`
+    /// plus `$GIT_DIR/info/attributes`.
     pub config_mtime: i64,
 }
 
@@ -774,15 +814,48 @@ fn mtime_secs(p: &Path) -> Option<i64> {
     Some(m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64)
 }
 
+fn mtime_ns(p: &Path) -> Option<i64> {
+    let m = std::fs::metadata(p).ok()?.modified().ok()?;
+    let ns = m.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    i64::try_from(ns).ok()
+}
+
+/// Newest `.gitattributes` under `root`, in nanoseconds. Skips `.git`.
+fn newest_gitattributes_ns(root: &Path) -> Option<i64> {
+    let mut best: Option<i64> = None;
+    let mut it = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(e) = entry else {
+            continue;
+        };
+        if e.file_type().is_dir() && e.file_name() == ".git" {
+            it.skip_current_dir();
+            continue;
+        }
+        if e.file_type().is_file()
+            && e.file_name() == ".gitattributes"
+            && let Some(ns) = mtime_ns(e.path())
+        {
+            best = Some(best.map_or(ns, |b| b.max(ns)));
+        }
+    }
+    best
+}
+
 /// Cheap fingerprint from ref files; falls back to one `git rev-parse` when needed.
 pub fn repo_fingerprint(root: &Path) -> Option<RepoFingerprint> {
     let git_dir = resolve_git_dir(root)?;
     let common = common_git_dir(&git_dir);
-    let config_mtime = [common.join("config"), root.join(".gitattributes")]
-        .iter()
-        .filter_map(|p| mtime_secs(p))
-        .max()
-        .unwrap_or(0);
+    let config_mtime = [
+        common.join("config"),
+        common.join("info/attributes"),
+        root.join(".gitattributes"),
+    ]
+    .iter()
+    .filter_map(|p| mtime_ns(p))
+    .chain(newest_gitattributes_ns(root))
+    .max()
+    .unwrap_or(0);
     let branch = read_ref(&common, "refs/heads/git-annex", 0);
     let head = read_head(&git_dir, &common);
     let (annex_branch, head) = match (branch, head) {
@@ -813,8 +886,15 @@ pub struct DiscoverOptions {
     pub one_file_system: bool,
 }
 
-pub fn find_annex_repos(root: &Path, opts: &DiscoverOptions) -> Vec<PathBuf> {
+pub struct RepoWalk {
+    pub repos: Vec<PathBuf>,
+    /// Directories the walk could not read.
+    pub unreadable: usize,
+}
+
+pub fn find_annex_repos(root: &Path, opts: &DiscoverOptions) -> RepoWalk {
     let mut repos = Vec::new();
+    let mut unreadable = 0usize;
     let mut walk = walkdir::WalkDir::new(root)
         .follow_links(false)
         .same_file_system(opts.one_file_system);
@@ -823,20 +903,18 @@ pub fn find_annex_repos(root: &Path, opts: &DiscoverOptions) -> Vec<PathBuf> {
     }
     let mut it = walk.into_iter();
     while let Some(entry) = it.next() {
-        let Ok(e) = entry else {
-            continue;
+        let e = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         };
         if !e.file_type().is_dir() {
             continue;
         }
-        let name = e.file_name().to_string_lossy();
-        if name == ".git" {
-            it.skip_current_dir();
-            continue;
-        }
-        let skip_noise = name == "target" || name == "node_modules";
-        let skip_hidden = e.depth() > 2 && name.starts_with('.');
-        if skip_noise || skip_hidden {
+        // `.git` holds objects, not nested annex checkouts.
+        if e.file_name() == ".git" {
             it.skip_current_dir();
             continue;
         }
@@ -846,7 +924,7 @@ pub fn find_annex_repos(root: &Path, opts: &DiscoverOptions) -> Vec<PathBuf> {
         }
     }
     repos.sort();
-    repos
+    RepoWalk { repos, unreadable }
 }
 
 /// Parse a git-annex log timestamp (`1317929189.157237s` or `1317929189s`) to unix seconds.
@@ -1084,6 +1162,7 @@ const NAMED_LOGS: &[&str] = &[
     "preferred-content.log",
     "required-content.log",
     "numcopies.log",
+    "mincopies.log",
 ];
 
 /// Read every log `load_metadata` needs with one `ls-tree` and one `cat-file --batch`.
@@ -1289,6 +1368,17 @@ fn collect_key_sizes(files: &[AnnexedFile], locations: &Locations) -> HashMap<Sh
     key_sizes
 }
 
+fn tree_unique_size(files: &[AnnexedFile]) -> u64 {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut total = 0u64;
+    for f in files {
+        if seen.insert(&f.key) {
+            total += f.size.unwrap_or(0);
+        }
+    }
+    total
+}
+
 fn size_totals(locations: &Locations, key_sizes: &HashMap<Shared, u64>) -> (u64, u64) {
     let mut unique_size = 0u64;
     let mut consumed_size = 0u64;
@@ -1354,6 +1444,51 @@ pub fn is_secret_remote_key(k: &str) -> bool {
     )
 }
 
+/// Split a NUL-separated byte buffer into records. A trailing NUL does not
+/// add an empty record.
+pub fn split_nul(buf: &[u8]) -> Vec<&[u8]> {
+    if buf.is_empty() {
+        return Vec::new();
+    }
+    let mut parts: Vec<&[u8]> = buf.split(|&b| b == 0).collect();
+    if parts.last().is_some_and(|p| p.is_empty()) {
+        parts.pop();
+    }
+    parts
+}
+
+/// `git check-attr -z` records: path, attribute, info, repeated.
+/// `info` is the value, `unspecified`, or `unset`.
+pub fn parse_check_attr_nul(buf: &[u8]) -> Vec<(String, String, String)> {
+    let recs = split_nul(buf);
+    recs.chunks(3)
+        .filter(|c| c.len() == 3)
+        .map(|c| {
+            (
+                String::from_utf8_lossy(c[0]).into_owned(),
+                String::from_utf8_lossy(c[1]).into_owned(),
+                String::from_utf8_lossy(c[2]).into_owned(),
+            )
+        })
+        .collect()
+}
+
+fn parse_attr_count(info: &str) -> Option<u32> {
+    if info == "unspecified" || info == "unset" || info.is_empty() {
+        None
+    } else {
+        info.parse().ok()
+    }
+}
+
+/// Copies required for one path. Per-path values override the repo values.
+/// `mincopies` is a floor: a lower per-path numcopies cannot go under it.
+pub fn copies_required(num: u32, min: u32, path_num: Option<u32>, path_min: Option<u32>) -> u32 {
+    let n = path_num.unwrap_or(num);
+    let m = path_min.unwrap_or(min);
+    n.max(m).max(1)
+}
+
 /// Parse `git annex find --format='${file}\000${key}\000${bytesize}\000'` output.
 pub fn parse_find_nul_triplets(buf: &[u8]) -> Vec<AnnexedFile> {
     let mut out = Vec::new();
@@ -1382,12 +1517,21 @@ pub fn parse_find_nul_triplets(buf: &[u8]) -> Vec<AnnexedFile> {
             path,
             key: key.into(),
             size,
+            copies_wanted: 0,
         });
     }
     out
 }
 
-fn find_files_with_format(root: &Path, use_branch: bool) -> Option<Vec<AnnexedFile>> {
+enum FindAttempt {
+    /// Command is missing entirely; further attempts will not work either.
+    Missing,
+    /// This invocation cannot be used (old git-annex, or a format it rejects).
+    Unsupported,
+    Ok(Vec<AnnexedFile>),
+}
+
+fn find_files_with_format(root: &Path, use_branch: bool) -> FindAttempt {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(root).arg("annex").arg("find");
     if use_branch {
@@ -1398,21 +1542,25 @@ fn find_files_with_format(root: &Path, use_branch: bool) -> Option<Vec<AnnexedFi
         .arg("--format=${file}\\000${key}\\000${bytesize}\\000")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return FindAttempt::Missing,
+        Err(_) => return FindAttempt::Unsupported,
+    };
     if !out.status.success() {
-        return None;
+        return FindAttempt::Unsupported;
     }
     if out.stdout.is_empty() {
-        return Some(Vec::new());
+        return FindAttempt::Ok(Vec::new());
     }
     if !out.stdout.contains(&0) {
-        return None;
+        return FindAttempt::Unsupported;
     }
-    Some(parse_find_nul_triplets(&out.stdout))
+    FindAttempt::Ok(parse_find_nul_triplets(&out.stdout))
 }
 
-fn find_annexed_paths(root: &Path) -> Vec<String> {
+fn find_annexed_paths(root: &Path) -> Result<Vec<String>> {
     let attempts: &[&[&str]] = &[
         &[
             "annex",
@@ -1425,18 +1573,18 @@ fn find_annexed_paths(root: &Path) -> Vec<String> {
         &["annex", "find", "--anything", "--print0"],
         &["annex", "find", "--print0"],
     ];
+    let mut last_err = String::from("git annex find failed");
     for args in attempts {
         let out = Command::new("git")
             .arg("-C")
             .arg(root)
             .args(*args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let Ok(out) = out else {
-            continue;
-        };
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("{}: running git annex find", root.display()))?;
         if !out.status.success() {
+            last_err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             continue;
         }
         let mut v = Vec::new();
@@ -1445,76 +1593,148 @@ fn find_annexed_paths(root: &Path) -> Vec<String> {
                 v.push(String::from_utf8_lossy(p).into_owned());
             }
         }
-        return v;
+        return Ok(v);
     }
-    Vec::new()
+    anyhow::bail!("{}: {last_err}", root.display())
 }
 
-fn lookup_keys_for_paths(root: &Path, paths: &[String]) -> Vec<AnnexedFile> {
+fn lookup_keys_for_paths(root: &Path, paths: &[String]) -> Result<Vec<AnnexedFile>> {
     if paths.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let mut child = match Command::new("git")
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
-        .arg("annex")
-        .arg("lookupkey")
-        .arg("--batch")
-        .arg("-z")
+        .args(["annex", "lookupkey", "--batch", "-z"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
+        .with_context(|| format!("{}: starting git annex lookupkey", root.display()))?;
     {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    {
-        let Some(mut stdin) = child.stdin.take() else {
-            return Vec::new();
-        };
+        let mut stdin = child.stdin.take().context("lookupkey stdin")?;
         for p in paths {
-            if stdin.write_all(p.as_bytes()).is_err() || stdin.write_all(&[0]).is_err() {
-                break;
-            }
+            stdin.write_all(p.as_bytes())?;
+            stdin.write_all(&[0])?;
         }
     }
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.wait();
-        return Vec::new();
-    };
+    let mut stdout = child.stdout.take().context("lookupkey stdout")?;
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf)?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("{}: git annex lookupkey failed ({status})", root.display());
+    }
+    let keys = split_nul(&buf);
+    if keys.len() != paths.len() {
+        anyhow::bail!(
+            "{}: git annex lookupkey returned {} keys for {} paths",
+            root.display(),
+            keys.len(),
+            paths.len()
+        );
+    }
     let mut files = Vec::new();
-    let reader = BufReader::new(stdout);
-    for (i, line_res) in reader.lines().enumerate() {
-        if let Ok(key) = line_res
-            && i < paths.len()
-            && !key.is_empty()
-        {
-            let path = paths[i].clone();
-            let size = parse_size_from_key(&key);
-            files.push(AnnexedFile {
-                path,
-                key: key.into(),
-                size,
-            });
+    for (path, key_b) in paths.iter().zip(keys) {
+        let key = String::from_utf8_lossy(key_b).into_owned();
+        if key.is_empty() {
+            continue;
         }
+        let size = parse_size_from_key(&key);
+        files.push(AnnexedFile {
+            path: path.clone(),
+            key: key.into(),
+            size,
+            copies_wanted: 0,
+        });
     }
-    let _ = child.wait();
-    files
+    Ok(files)
 }
 
 /// All annexed files recorded in git, with sizes from git-annex (not the filesystem).
 ///
 /// Prefers `git annex find --branch HEAD --anything` so files still appear when
-/// their content is dropped or the working-tree symlink is missing.
-pub fn load_annexed_files(root: &Path) -> Vec<AnnexedFile> {
-    if let Some(files) = find_files_with_format(root, true) {
-        return files;
+/// their content is dropped or the working-tree symlink is missing. A failure
+/// of every method is an error: an empty list means the repo really has no
+/// annexed files.
+pub fn load_annexed_files(root: &Path) -> Result<Vec<AnnexedFile>> {
+    match find_files_with_format(root, true) {
+        FindAttempt::Ok(v) => return Ok(v),
+        FindAttempt::Missing => {
+            anyhow::bail!("{}: git is not installed", root.display());
+        }
+        FindAttempt::Unsupported => {}
     }
-    if let Some(files) = find_files_with_format(root, false) {
-        return files;
+    match find_files_with_format(root, false) {
+        FindAttempt::Ok(v) => return Ok(v),
+        FindAttempt::Missing => {
+            anyhow::bail!("{}: git is not installed", root.display());
+        }
+        FindAttempt::Unsupported => {}
     }
-    lookup_keys_for_paths(root, &find_annexed_paths(root))
+    lookup_keys_for_paths(root, &find_annexed_paths(root)?)
+}
+
+/// Fill `copies_wanted` from repo numcopies/mincopies and `git check-attr`.
+/// A check-attr failure keeps the repo-wide number; it does not fail the load.
+fn apply_copy_requirements(root: &Path, files: &mut [AnnexedFile], num: u32, min: u32) {
+    let fallback = copies_required(num, min, None, None);
+    for f in files.iter_mut() {
+        f.copies_wanted = fallback;
+    }
+    if files.is_empty() {
+        return;
+    }
+    let Ok(buf) = check_attr_counts(root, files) else {
+        return;
+    };
+    let mut by_path: HashMap<String, (Option<u32>, Option<u32>)> = HashMap::new();
+    for (path, attr, info) in parse_check_attr_nul(&buf) {
+        let slot = by_path.entry(path).or_insert((None, None));
+        let n = parse_attr_count(&info);
+        if attr == "annex.numcopies" {
+            slot.0 = n;
+        } else if attr == "annex.mincopies" {
+            slot.1 = n;
+        }
+    }
+    for f in files.iter_mut() {
+        let (path_num, path_min) = by_path.get(&f.path).copied().unwrap_or((None, None));
+        f.copies_wanted = copies_required(num, min, path_num, path_min);
+    }
+}
+
+fn check_attr_counts(root: &Path, files: &[AnnexedFile]) -> Result<Vec<u8>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "check-attr",
+            "-z",
+            "annex.numcopies",
+            "annex.mincopies",
+            "--stdin",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting git check-attr")?;
+    {
+        let mut stdin = child.stdin.take().context("check-attr stdin")?;
+        for f in files {
+            stdin.write_all(f.path.as_bytes())?;
+            stdin.write_all(&[0])?;
+        }
+    }
+    let mut stdout = child.stdout.take().context("check-attr stdout")?;
+    let mut buf = Vec::new();
+    stdout.read_to_end(&mut buf)?;
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("git check-attr failed ({status})");
+    }
+    Ok(buf)
 }
 
 /// `annex.*` git config in one call. Keys are lowercase (`annex.uuid`).
@@ -1572,9 +1792,14 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let logs = read_branch_logs(&root)?;
     let log = |name: &str| logs.named.get(name).map(String::as_str).unwrap_or("");
 
-    // `git annex numcopies` (branch) overrides the legacy annex.numcopies git config.
-    let numcopies = parse_count_log(log("numcopies.log"))
-        .or_else(|| cfg("annex.numcopies").and_then(|s| s.parse().ok()));
+    // Branch logs override the legacy git config. mincopies is a floor.
+    let num_only = parse_count_log(log("numcopies.log"))
+        .or_else(|| cfg("annex.numcopies").and_then(|s| s.parse().ok()))
+        .unwrap_or(1);
+    let min_only = parse_count_log(log("mincopies.log"))
+        .or_else(|| cfg("annex.mincopies").and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let numcopies = copies_required(num_only, min_only, None, None);
 
     let uuid_entries = parse_uuid_log(log("uuid.log"));
     let remote_cfgs = parse_remote_log(log("remote.log"));
@@ -1647,8 +1872,9 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
 
     // Collect additional configurations (numcopies, gitattributes etc.)
     let mut additional_configs = vec![];
-    if let Some(n) = numcopies {
-        additional_configs.push(format!("annex.numcopies={}", n));
+    additional_configs.push(format!("annex.numcopies={num_only}"));
+    if min_only > 0 {
+        additional_configs.push(format!("annex.mincopies={min_only}"));
     }
     // Top-level .gitattributes annex.* settings (numcopies per path etc.)
     if let Ok(content) = std::fs::read_to_string(root.join(".gitattributes")) {
@@ -1662,7 +1888,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     for (k, v) in &config {
         if !matches!(
             k.as_str(),
-            "annex.numcopies" | "annex.uuid" | "annex.describe"
+            "annex.numcopies" | "annex.mincopies" | "annex.uuid" | "annex.describe"
         ) {
             additional_configs.push(format!("{k} {v}"));
         }
@@ -1670,7 +1896,8 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
 
     // Working-tree / HEAD annexed files. Sizes come from git-annex (key / bytesize),
     // so dropped or missing content is still listed.
-    let files = load_annexed_files(&root);
+    let mut files = load_annexed_files(&root)?;
+    apply_copy_requirements(&root, &mut files, num_only, min_only);
 
     let mut locations = logs.locations;
     drop_dead_remotes(&uuid, &mut remotes, &mut locations);
@@ -1679,6 +1906,7 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
     let key_sizes = collect_key_sizes(&files, &locations);
     apply_present_stats(&mut remotes, &locations, &key_sizes);
     let (unique_size, consumed_size) = size_totals(&locations, &key_sizes);
+    let tree_sz = tree_unique_size(&files);
 
     // Fill local desc if empty
     let description = if desc.is_empty() {
@@ -1695,12 +1923,13 @@ pub fn load_metadata(repo: &Path) -> Result<AnnexMetadata> {
         root,
         uuid,
         description,
-        numcopies,
+        numcopies: Some(numcopies),
         additional_configs,
         remotes,
         locations,
         files,
         total_keys,
+        tree_unique_size: tree_sz,
         unique_size,
         consumed_size,
         fingerprint,
@@ -1958,12 +2187,78 @@ u2 something else timestamp=9s
         std::fs::write(root.join("plain/file.txt"), b"hi").unwrap();
 
         let found = find_annex_repos(&root, &DiscoverOptions::default());
-        assert_eq!(found.len(), 2, "found {found:?}");
+        assert_eq!(found.repos.len(), 2, "found {:?}", found.repos);
         assert!(
             found
+                .repos
                 .iter()
                 .all(|p| p.ends_with("photos") || p.ends_with("docs"))
         );
+    }
+
+    #[test]
+    fn find_annex_repos_enters_hidden_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let album = tmp.path().join(".hidden").join("album");
+        touch_annex_git(&album);
+        let found = find_annex_repos(tmp.path(), &DiscoverOptions::default());
+        assert!(
+            found.repos.iter().any(|p| p.ends_with("album")),
+            "found {:?}",
+            found.repos
+        );
+    }
+
+    #[test]
+    fn copies_required_uses_mincopies_as_a_floor() {
+        assert_eq!(copies_required(1, 3, None, None), 3);
+        assert_eq!(copies_required(2, 2, Some(1), None), 2);
+        assert_eq!(copies_required(1, 1, Some(4), None), 4);
+        assert_eq!(copies_required(1, 1, Some(1), Some(5)), 5);
+    }
+
+    #[test]
+    fn check_attr_nul_records_are_triples() {
+        let mut buf = b"dir/a.jpg\0annex.numcopies\0".to_vec();
+        buf.extend_from_slice(b"4\0dir/a.jpg\0annex.mincopies\0unspecified\0");
+        let rows = parse_check_attr_nul(&buf);
+        assert_eq!(
+            rows,
+            vec![
+                ("dir/a.jpg".into(), "annex.numcopies".into(), "4".into()),
+                (
+                    "dir/a.jpg".into(),
+                    "annex.mincopies".into(),
+                    "unspecified".into()
+                ),
+            ]
+        );
+        assert_eq!(split_nul(b"a\0b\0").len(), 2);
+        assert!(split_nul(b"").is_empty());
+    }
+
+    #[test]
+    fn per_file_requirement_can_mark_a_file_at_risk() {
+        let mut m = crate::testutil::sample_meta();
+        let key = m
+            .files
+            .iter()
+            .find(|f| f.path == "2024/a.jpg")
+            .unwrap()
+            .key
+            .clone();
+        assert_eq!(m.counting_copies(&key), 2);
+        m.files
+            .iter_mut()
+            .find(|f| f.path == "2024/a.jpg")
+            .unwrap()
+            .copies_wanted = 3;
+        let paths: Vec<&str> = m
+            .at_risk_files()
+            .iter()
+            .map(|(f, _)| f.path.as_str())
+            .collect();
+        assert!(paths.contains(&"2024/a.jpg"), "{paths:?}");
     }
 
     #[test]
@@ -2016,7 +2311,11 @@ u2 something else timestamp=9s
         let ok = is_annex_repo(&wt);
         let found = find_annex_repos(&root, &DiscoverOptions::default());
         assert!(ok);
-        assert!(found.iter().any(|p| p.ends_with("tree")), "found {found:?}");
+        assert!(
+            found.repos.iter().any(|p| p.ends_with("tree")),
+            "found {:?}",
+            found.repos
+        );
     }
 
     #[test]
@@ -2354,7 +2653,7 @@ here-uuid 1 timestamp=125s
         };
         crate::testutil::git(&root, &["annex", "drop", "--force", "-q", "videos/big.mkv"]);
         std::fs::remove_file(root.join("photos/small.jpg")).unwrap();
-        let files = load_annexed_files(&root);
+        let files = load_annexed_files(&root).expect("load files");
         let meta = load_metadata(&root);
         crate::testutil::make_writable(&root);
         let by_path: HashMap<_, _> = files.iter().map(|f| (f.path.as_str(), f)).collect();

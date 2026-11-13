@@ -22,14 +22,25 @@ pub struct Found {
     pub fingerprint: Option<RepoFingerprint>,
 }
 
-pub fn discover(root: &Path, opts: &DiscoverOptions) -> Vec<Found> {
-    annex::find_annex_repos(root, opts)
-        .into_iter()
-        .map(|path| Found {
-            fingerprint: annex::repo_fingerprint(&path),
-            path,
-        })
-        .collect()
+pub struct Discovery {
+    pub found: Vec<Found>,
+    /// Directories the walk could not read.
+    pub unreadable: usize,
+}
+
+pub fn discover(root: &Path, opts: &DiscoverOptions) -> Discovery {
+    let walk = annex::find_annex_repos(root, opts);
+    Discovery {
+        unreadable: walk.unreadable,
+        found: walk
+            .repos
+            .into_iter()
+            .map(|path| Found {
+                fingerprint: annex::repo_fingerprint(&path),
+                path,
+            })
+            .collect(),
+    }
 }
 
 /// Whether the cached load of `found` is still current.
@@ -96,7 +107,7 @@ mod tests {
             return;
         };
         let cache = Cache::at(tmp.path().join("cache"));
-        let found = discover(tmp.path(), &DiscoverOptions::default());
+        let found = discover(tmp.path(), &DiscoverOptions::default()).found;
         assert_eq!(found.len(), 1);
         assert_eq!(
             needs_load(&found, &cache.load_index(), false),
@@ -108,13 +119,13 @@ mod tests {
             loaded.push(res.unwrap())
         });
         cache.store_repo(&loaded[0]).unwrap();
-        let found = discover(tmp.path(), &DiscoverOptions::default());
+        let found = discover(tmp.path(), &DiscoverOptions::default()).found;
         assert!(needs_load(&found, &cache.load_index(), false).is_empty());
         assert_eq!(needs_load(&found, &cache.load_index(), true).len(), 1);
 
         // Any git-annex branch change (here: a new description) invalidates the cache.
         crate::testutil::git(&root, &["annex", "describe", "here", "renamed"]);
-        let found = discover(tmp.path(), &DiscoverOptions::default());
+        let found = discover(tmp.path(), &DiscoverOptions::default()).found;
         assert_eq!(
             needs_load(&found, &cache.load_index(), false),
             vec![root.clone()]

@@ -19,23 +19,23 @@ All this information is available via normal `git annex` commands, but querying 
 
 **Binary name:** `git-annex-browser`
 
-Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, per-key location logs, and so on) plus `git annex find --branch HEAD --anything`. File sizes come from annex keys (`bytesize`), not the filesystem, so dropped or missing working-tree files still appear. Location logs include untrusted remotes (e.g. Glacier), so used-storage figures update after `git annex copy --to` without a slow `whereis --all`. The TUI itself is view-only.
+Metadata is read from the git-annex branch logs (`uuid.log`, `trust.log`, `group.log`, `numcopies.log`, `mincopies.log`, per-key location logs, and so on) plus `git annex find --branch HEAD --anything`. File sizes come from annex keys (`bytesize`), not the filesystem, so dropped or missing working-tree files still appear. Location-log totals include every key still recorded there, including old versions that are no longer in the working tree. Working-tree size and "at risk" count only current files. Location logs include untrusted remotes (e.g. Glacier), so used-storage figures update after `git annex copy --to` without a slow `whereis --all`. The TUI itself is view-only.
 
 ## Features
-- Recursive discovery of annex repos under the given root (skips `.git` object stores; follows `gitdir:` worktrees). Refs are read from disk, so plain git repos cost no extra process.
+- Recursive discovery of annex repos under the given root, including hidden directories (skips `.git` object stores; follows `gitdir:` worktrees). Directories that cannot be read are counted in the status line. Refs are read from disk, so plain git repos cost no extra process.
 - Per-repo view of:
   - Summary (uuid, counts, trust breakdown, last fsck)
   - **Drives / remotes** list with type, trust (`T`/`?`/`U`, colored), present key counts, last fsck, sorted by most recent fsck. A drive is shown in red when its trust, groups, wanted or required setting differs from the same-named drive in most other repos. Remotes marked `git annex dead` are omitted.
   - Files present on a specific drive (including here), from cached location data so offline drives stay browsable
   - All annexed files in the working tree, each annotated with short presence badges
   - **Disk usage** (ncdu-style): directories and files sorted largest-first, with size bars. Sizes are from git-annex keys, so this works when content is not present here
-  - **At risk**: working-tree files with fewer counting copies than numcopies (untrusted copies such as Glacier do not count), fewest copies first
+  - **At risk**: working-tree files with fewer counting copies than they require. The requirement is `max(numcopies, mincopies)`, and a path can raise either value in `.gitattributes`. Untrusted copies such as Glacier do not count. Fewest copies first
   - **Missing here**: how many files have no content in this clone, and which drives to connect, in order, to `git annex get` them all (local drives first, then special remotes, untrusted last)
 - For each file: locations (trusted and untrusted copies) + key + size
 - The TUI shows the cache immediately. Discovery, cache reads, repo loads and cache writes run in the background, so navigation never waits on disk.
 - Only repos whose git-annex branch, `HEAD` or config changed since the last scan are reloaded. `r` reloads everything.
 - Cached repos that a scan no longer finds (unplugged drive) stay listed and browsable, marked "not found since …".
-- Global report includes unique vs total-with-copies size, plus storage per special remote (rclone etc.; other annex clones are omitted)
+- Global report includes location-log size (one copy, and total with copies), plus storage per special remote (rclone etc.; other annex clones are omitted). Those figures include old versions still in the location logs. The copy-health bar counts working-tree files only.
 - Live visual report: per-repo size bars and copy-health colour (red=under numcopies, yellow=mixed, green=ok). Repos with keys under numcopies get a `↓` in the list. `z` (or Enter on the report) zooms to full screen.
 - Keyboard and mouse navigation like zfs-browser; `/` filters the current list; `s` sorts repos by name, size, copy health or file count
 

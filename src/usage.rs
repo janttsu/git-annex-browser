@@ -168,17 +168,18 @@ impl Node for ParentDirNode {
 
 pub struct UsageDirNode {
     meta: Arc<AnnexMetadata>,
-    tree: Rc<UsageTree>,
+    /// Built the first time the usage view is opened, not when the repo menu is shown.
+    tree: OnceCell<Rc<UsageTree>>,
     dir_path: String,
     children: OnceCell<Children>,
 }
 
 impl UsageDirNode {
-    /// Top of the usage tree. `tree` is built once per loaded repo and shared.
-    pub fn root(meta: Arc<AnnexMetadata>, tree: Rc<UsageTree>) -> Self {
+    /// Top of the usage tree. The directory map is built on first open.
+    pub fn root(meta: Arc<AnnexMetadata>) -> Self {
         Self {
             meta,
-            tree,
+            tree: OnceCell::new(),
             dir_path: String::new(),
             children: OnceCell::new(),
         }
@@ -187,12 +188,21 @@ impl UsageDirNode {
     fn is_root(&self) -> bool {
         self.dir_path.is_empty()
     }
+
+    fn tree(&self) -> &Rc<UsageTree> {
+        self.tree
+            .get_or_init(|| Rc::new(UsageTree::build(&self.meta.files)))
+    }
 }
 
 impl Node for UsageDirNode {
     fn label(&self) -> String {
         if self.is_root() {
-            let (sz, n) = self.tree.stats("");
+            let (sz, n) = self
+                .tree
+                .get()
+                .map(|t| t.stats(""))
+                .unwrap_or((self.meta.tree_unique_size, self.meta.files.len()));
             format!(
                 "disk usage — {}, {} files, largest first",
                 human_bytes(sz),
@@ -217,28 +227,31 @@ impl Node for UsageDirNode {
         if self.is_root() {
             None
         } else {
-            Some(self.tree.stats(&self.dir_path).0)
+            Some(self.tree().stats(&self.dir_path).0)
         }
     }
     fn initial_selected(&self) -> usize {
         // Skip `..` so the largest child is selected, like ncdu.
-        if self.tree.children_sorted(&self.dir_path).is_empty() {
+        if self.tree().children_sorted(&self.dir_path).is_empty() {
             0
         } else {
             1
         }
     }
     fn usage_listing(&self) -> Option<UsageListing> {
-        Some(self.tree.listing(&self.dir_path))
+        Some(self.tree().listing(&self.dir_path))
     }
     fn children(&self) -> Children {
         Rc::clone(self.children.get_or_init(|| {
             let mut kids: Vec<Rc<dyn Node>> = vec![Rc::new(ParentDirNode)];
-            for child in self.tree.children_sorted(&self.dir_path) {
+            let tree = Rc::clone(self.tree());
+            for child in tree.children_sorted(&self.dir_path) {
                 if child.is_dir {
+                    let cell = OnceCell::new();
+                    let _ = cell.set(Rc::clone(&tree));
                     kids.push(Rc::new(UsageDirNode {
                         meta: Arc::clone(&self.meta),
-                        tree: Rc::clone(&self.tree),
+                        tree: cell,
                         dir_path: child.rel_path.clone(),
                         children: OnceCell::new(),
                     }));
@@ -257,7 +270,7 @@ impl Node for UsageDirNode {
         }))
     }
     fn details(&self) -> Vec<String> {
-        let (sz, n) = self.tree.stats(&self.dir_path);
+        let (sz, n) = self.tree().stats(&self.dir_path);
         let path = if self.dir_path.is_empty() {
             "/".to_string()
         } else {
@@ -272,7 +285,7 @@ impl Node for UsageDirNode {
         ]
     }
     fn raw_text(&self) -> Option<String> {
-        let listing = self.tree.listing(&self.dir_path);
+        let listing = self.tree().listing(&self.dir_path);
         let mut s = format!(
             "{}\n{}  {} files\n",
             listing.path,
@@ -345,6 +358,7 @@ mod tests {
             path: path.into(),
             key: format!("SHA256E-s{size}--{path}").into(),
             size: Some(size),
+            copies_wanted: 0,
         }
     }
 

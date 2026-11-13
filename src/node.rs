@@ -8,7 +8,7 @@ once per node and shared as `Rc<[..]>`, so moving the selection never rebuilds t
 use crate::annex::{
     AnnexMetadata, AnnexedFile, DriveProfile, Remote, RepoSummary, TrustLevel, parse_size_from_key,
 };
-use crate::usage::{UsageDirNode, UsageListing, UsageTree};
+use crate::usage::{UsageDirNode, UsageListing};
 use crate::util::{fmt_unix, human_bytes, short_uuid};
 use std::cell::OnceCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -219,11 +219,11 @@ impl Node for GlobalReportNode {
             remotes_line,
             format!("Keys present here (across repos): {}", total_here),
             format!(
-                "Unique data size (1 copy each): {}",
+                "Location logs, 1 copy each (includes old versions): {}",
                 human_bytes(total_unique)
             ),
             format!(
-                "Total storage used across drives (with copies): {}",
+                "Location logs across drives (with copies): {}",
                 human_bytes(total_consumed)
             ),
         ];
@@ -337,16 +337,16 @@ impl Node for RepoSummaryNode {
         d.push(format!("known remotes/drives: {}", s.remote_count));
         d.push(format!("keys present here: {}", s.here_present_count));
         d.push(format!(
-            "unique data size (1 copy): {}",
+            "location logs, 1 copy each (includes old versions): {}",
             human_bytes(s.unique_size)
         ));
         d.push(format!(
-            "consumed across drives: {}",
+            "location logs across drives (with copies): {}",
             human_bytes(s.consumed_size)
         ));
         if s.keys_under > 0 {
             d.push(format!(
-                "keys under numcopies: {} of {}",
+                "working-tree files under required copies: {} of {}",
                 s.keys_under, s.keys_tracked
             ));
         }
@@ -409,12 +409,11 @@ impl Node for RepoNode {
     fn children(&self) -> Children {
         cached(&self.children, || {
             let meta = &self.meta;
-            let usage = Rc::new(UsageTree::build(&meta.files));
             let mut kids: Vec<Rc<dyn Node>> = vec![
                 Rc::new(RepoVisualNode {
                     root: meta.root.clone(),
                 }),
-                Rc::new(UsageDirNode::root(Arc::clone(meta), usage)),
+                Rc::new(UsageDirNode::root(Arc::clone(meta))),
                 Rc::new(DrivesNode {
                     meta: Arc::clone(meta),
                     drive_profiles: Rc::clone(&self.drive_profiles),
@@ -460,9 +459,16 @@ impl Node for RepoNode {
             format!("description: {}", m.description),
             format!("annexed files (working tree): {}", m.files.len()),
             format!("known keys (locations): {}", m.total_keys),
-            format!("unique data size (1 copy): {}", human_bytes(m.unique_size)),
             format!(
-                "consumed across all drives (with copies): {}",
+                "working tree size (current files, 1 copy): {}",
+                human_bytes(m.tree_unique_size)
+            ),
+            format!(
+                "location logs, 1 copy each (includes old versions): {}",
+                human_bytes(m.unique_size)
+            ),
+            format!(
+                "location logs across drives (with copies): {}",
                 human_bytes(m.consumed_size)
             ),
             format!("known remotes/drives: {}", m.remotes.len()),
@@ -553,11 +559,7 @@ pub struct AtRiskNode {
 
 impl Node for AtRiskNode {
     fn label(&self) -> String {
-        format!(
-            "at risk: {} files under numcopies {}",
-            self.count,
-            self.meta.wanted_copies()
-        )
+        format!("at risk: {} files under their required copies", self.count)
     }
     fn kind(&self) -> NodeKind {
         NodeKind::Files
@@ -586,14 +588,19 @@ impl Node for AtRiskNode {
         let none = risk.iter().filter(|(_, n)| *n == 0).count();
         vec![
             format!(
-                "{} working-tree files have fewer than {} counting copies ({}).",
+                "{} working-tree files are under their required copies ({}).",
                 risk.len(),
-                self.meta.wanted_copies(),
                 human_bytes(bytes)
             ),
+            format!(
+                "Repo default is max(numcopies, mincopies) = {}.",
+                self.meta.wanted_copies()
+            ),
+            "A path can require more via annex.numcopies or annex.mincopies in .gitattributes."
+                .into(),
             format!("{none} of them have no trusted or semitrusted copy at all."),
-            "Copies on untrusted remotes (e.g. Glacier) and dead remotes do not count,".into(),
-            "matching how git-annex applies numcopies. Fewest copies first.".into(),
+            "Copies on untrusted remotes (e.g. Glacier) and dead remotes do not count.".into(),
+            "Fewest copies first.".into(),
         ]
     }
 }
@@ -988,26 +995,91 @@ impl FileTreeNode {
             })
             .collect();
         // Keys on the drive with no working-tree path (old versions, unused content).
+        // One summary row; the individual keys are built only if that row is opened.
         if self.is_top()
             && let Some(drive) = self.scope.drive_uuid()
         {
+            let mut count = 0usize;
+            let mut bytes = 0u64;
             for (key, locs) in &self.meta.locations {
                 if locs.contains(drive) && !seen_keys.contains(&**key) {
-                    files.push(Rc::new(AnnexFileNode {
-                        meta: Arc::clone(&self.meta),
-                        file: AnnexedFile {
-                            path: format!("<unused key> {key}"),
-                            key: key.clone(),
-                            size: parse_size_from_key(key),
-                        },
-                        highlight_drive: highlight.clone(),
-                    }));
+                    count += 1;
+                    bytes += parse_size_from_key(key).unwrap_or(0);
                 }
+            }
+            if count > 0 {
+                files.push(Rc::new(UnusedKeysNode {
+                    meta: Arc::clone(&self.meta),
+                    drive: drive.to_string(),
+                    count,
+                    bytes,
+                    children: OnceCell::new(),
+                }));
             }
         }
         files.sort_by_cached_key(|n| n.label());
         kids.extend(files);
         kids
+    }
+}
+
+/// Old and unused keys on one drive. The per-key rows are built only when opened.
+struct UnusedKeysNode {
+    meta: Arc<AnnexMetadata>,
+    drive: String,
+    count: usize,
+    bytes: u64,
+    children: OnceCell<Children>,
+}
+
+impl Node for UnusedKeysNode {
+    fn label(&self) -> String {
+        format!(
+            "not in working tree: {} keys, {}",
+            self.count,
+            human_bytes(self.bytes)
+        )
+    }
+    fn kind(&self) -> NodeKind {
+        NodeKind::Info
+    }
+    fn children(&self) -> Children {
+        cached(&self.children, || {
+            let in_tree: HashSet<&str> = self.meta.files.iter().map(|f| f.key.as_ref()).collect();
+            let mut files: Vec<Rc<dyn Node>> = self
+                .meta
+                .locations
+                .iter()
+                .filter(|(key, locs)| {
+                    locs.contains(self.drive.as_str()) && !in_tree.contains(key.as_ref())
+                })
+                .map(|(key, _)| {
+                    Rc::new(AnnexFileNode {
+                        meta: Arc::clone(&self.meta),
+                        file: AnnexedFile {
+                            path: format!("(not in working tree) {key}"),
+                            key: key.clone(),
+                            size: parse_size_from_key(key),
+                            copies_wanted: 0,
+                        },
+                        highlight_drive: Some(self.drive.clone()),
+                    }) as Rc<dyn Node>
+                })
+                .collect();
+            files.sort_by_cached_key(|n| n.label());
+            files
+        })
+    }
+    fn details(&self) -> Vec<String> {
+        vec![
+            format!(
+                "{} keys on this drive are not in the working tree.",
+                self.count
+            ),
+            format!("size from keys: {}", human_bytes(self.bytes)),
+            "These are old versions or unused content still recorded in the location log.".into(),
+            "Drive totals above include them. At risk counts only working-tree files.".into(),
+        ]
     }
 }
 
@@ -1052,7 +1124,7 @@ impl Node for FileTreeNode {
             TreeScope::Drive(uuid, name) => vec![
                 format!("Drive: {name} ({uuid})"),
                 "Files whose content is recorded as present on this drive.".into(),
-                "For working tree files the path is shown; unused keys shown with <unused key> prefix."
+                "Working-tree files are listed directly. Keys that are only in the location log are under 'not in working tree'."
                     .into(),
             ],
         }
@@ -1189,9 +1261,20 @@ mod tests {
             !top.contains(&"2023/".to_string()),
             "2023 has no usb copy: {top:?}"
         );
+        let summary = top
+            .iter()
+            .find(|l| l.starts_with("not in working tree:"))
+            .expect("summary row");
+        assert!(summary.contains("1 keys"), "{summary}");
+        let kids = tree.children();
+        let row = kids
+            .iter()
+            .find(|c| c.label().starts_with("not in working tree:"))
+            .unwrap();
+        let inner = labels(row.as_ref());
         assert!(
-            top.iter()
-                .any(|l| l.starts_with("<unused key> SHA256E-s7--old"))
+            inner.iter().any(|l| l.contains("SHA256E-s7--old")),
+            "{inner:?}"
         );
     }
 

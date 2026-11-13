@@ -556,7 +556,7 @@ fn render_visual_report(
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::raw("unique "),
+        Span::raw("keys "),
         Span::styled(
             human_bytes(vis.unique_size),
             Style::default()
@@ -575,7 +575,7 @@ fn render_visual_report(
         Span::styled("✓ok ", Style::default().fg(Color::Green)),
         Span::styled("↑extra ", Style::default().fg(Color::Cyan)),
         Span::styled(
-            "bar color = copy health vs numcopies",
+            "bar color = working-tree copy health",
             Style::default().fg(Color::DarkGray),
         ),
     ]));
@@ -645,7 +645,7 @@ fn render_repo_visual(
     let mut lines: Vec<Line> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::raw("unique "),
+        Span::raw("keys "),
         Span::styled(
             human_bytes(vis.unique_size),
             Style::default()

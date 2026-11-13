@@ -126,7 +126,11 @@ fn refresh_cache(
         );
     }
     let index = cache.load_index();
-    let found = scan::discover(scan_root, &cfg.discover_options());
+    let discovery = scan::discover(scan_root, &cfg.discover_options());
+    if verbose && discovery.unreadable > 0 {
+        eprintln!("{} directories could not be read", discovery.unreadable);
+    }
+    let found = discovery.found;
     let todo = scan::needs_load(&found, &index, cfg.force_rescan);
     if verbose {
         eprintln!("Found {} repos, {} new or changed", found.len(), todo.len());

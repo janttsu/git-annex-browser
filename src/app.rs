@@ -273,6 +273,10 @@ impl App {
         self.stack[0].selected = 0;
     }
 
+    pub fn is_loaded(&self, path: &Path) -> bool {
+        self.preloaded.contains_key(path)
+    }
+
     /// The loading placeholder on top of the stack, if any.
     pub fn awaiting_load(&self) -> Option<PathBuf> {
         self.stack
@@ -466,9 +470,20 @@ pub struct ListItem {
 /// Case-insensitive match of a list row against the `/` filter.
 /// `filter_lower` must already be lowercase.
 pub fn matches_filter(item: &ListItem, filter_lower: &str) -> bool {
-    filter_lower.is_empty()
-        || item.label.to_lowercase().contains(filter_lower)
-        || item.kind.label().contains(filter_lower)
+    if filter_lower.is_empty() {
+        return true;
+    }
+    let hay = format!(
+        "{} {} {}",
+        item.label,
+        item.repo_name.as_deref().unwrap_or(""),
+        item.kind.label()
+    )
+    .to_lowercase();
+    // Every whitespace-separated term must match, so "jpg 2024" finds a path.
+    filter_lower
+        .split_whitespace()
+        .all(|term| hay.contains(term))
 }
 
 /// Indices of list rows visible under `filter`.

@@ -17,6 +17,7 @@ pub fn meta(root: &str) -> AnnexMetadata {
         locations: HashMap::new(),
         files: vec![],
         total_keys: 0,
+        tree_unique_size: 0,
         unique_size: 0,
         consumed_size: 0,
         fingerprint: None,
@@ -32,6 +33,7 @@ pub fn file(path: &str, size: u64) -> AnnexedFile {
         path: path.into(),
         key: format!("SHA256E-s{size}--{}", path.replace('/', "_")).into(),
         size: Some(size),
+        copies_wanted: 0,
     }
 }
 

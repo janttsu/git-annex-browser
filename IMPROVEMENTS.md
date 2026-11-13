@@ -6,7 +6,21 @@ menevät läpi. Havainnot perustuvat koodin lukemiseen, ei profilointiin, ellei 
 mainita. Mittapisteenä käytettiin keskikokoista testikokoelmaa: kymmenkunta repoa,
 kymmeniä tuhansia tiedostoja ja satoja tuhansia sijaintimerkintöjä.
 
-Rivinumerot viittaavat yllä mainittuun commitiin.
+Rivinumerot alla viittaavat vanhaan versioon. Lista on historiallinen.
+
+## Korjaukset 2026-11
+
+- Repon avaus ei jää latausnäkymään, jos sen välimuistitiedosto puuttuu muiden lukujen aikana.
+- Vaadittu kopiomäärä on `max(numcopies, mincopies)`. Polkukohtaiset arvot luetaan `.gitattributes`-tiedostoista (`git check-attr`).
+- `git annex find` -virhe keskeyttää repon latauksen. `lookupkey -z` luetaan NUL-erottimella.
+- Välimuistin sormenjälki käyttää nanosekunteja ja kaikkia `.gitattributes`-tiedostoja sekä `info/attributes`.
+- Työpuun koko ja at risk laskevat nykyiset tiedostot. Sijaintilokin koko kertoo myös vanhat versiot, ja se sanotaan näytössä.
+- Haku käy piilohakemistot. Lukemattomat hakemistot näkyvät tilassa.
+- `r` hylkää edellisen skannauksen kesken olevat tulokset. "unchanged" lasketaan vain tästä kierroksesta, ja skannauksen edistyminen lisätään saman rivin perään.
+- Käyttöpuu rakennetaan vasta kun näkymä avataan. Aseman ylimääräiset avaimet ovat yksi yhteenvetorivi, kunnes sen avaa.
+- Suodatin vaatii jokaisen välilyönnillä erotetun sanan ja katsoo myös repon nimeä.
+
+Versio on 0.2.0. GitHub-release syntyy tagista `v0.2.0`; sitä ei ole vielä tehty.
 
 ## Toteutustila (päivitetty 2026-09-27)
 

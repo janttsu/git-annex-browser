@@ -34,11 +34,48 @@ pub enum WorkerOut {
 
 enum Event {
     Ui(WorkerMsg),
-    Discovered(Vec<Found>),
+    Discovered {
+        epoch: u64,
+        found: Vec<Found>,
+        unreadable: usize,
+    },
     /// Metadata read from the cache (None: file missing or unreadable).
-    Cached(PathBuf, Option<AnnexMetadata>),
+    Cached {
+        epoch: u64,
+        path: PathBuf,
+        meta: Option<AnnexMetadata>,
+    },
     /// Metadata loaded from the repo on disk.
-    Loaded(PathBuf, Result<AnnexMetadata>),
+    Loaded {
+        epoch: u64,
+        path: PathBuf,
+        res: Result<AnnexMetadata>,
+    },
+}
+
+/// What to do when the user opens a repo that is not on screen yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenStep {
+    /// Metadata is already in memory.
+    Done,
+    /// This path's cache read is still running.
+    Wait,
+    /// The index has an entry we have not read yet.
+    ReadCache,
+    /// Read the repo from disk.
+    Disk,
+}
+
+fn open_step(loaded: bool, inflight: bool, requested: bool, indexed: bool) -> OpenStep {
+    if loaded {
+        OpenStep::Done
+    } else if inflight {
+        OpenStep::Wait
+    } else if !requested && indexed {
+        OpenStep::ReadCache
+    } else {
+        OpenStep::Disk
+    }
 }
 
 enum Persist {
@@ -82,10 +119,16 @@ struct Worker {
     scan_total: usize,
     /// Repos loaded from disk this session; later cache reads must not override them.
     fresh: HashSet<PathBuf>,
-    /// Repos whose cache file has been read (or requested).
+    /// Repos whose cache file has been read (or requested) in this epoch.
     cache_requested: HashSet<PathBuf>,
+    /// Cache reads that have not reported back yet.
+    cache_inflight: HashSet<PathBuf>,
     discovering: bool,
     cached_loading: usize,
+    /// Bumped on refresh so late results from the previous scan are ignored.
+    epoch: u64,
+    /// "found N repos …" line. Scan progress is appended to it.
+    found_status: String,
 }
 
 pub fn spawn(
@@ -110,8 +153,11 @@ pub fn spawn(
             scan_total: 0,
             fresh: HashSet::new(),
             cache_requested: HashSet::new(),
+            cache_inflight: HashSet::new(),
             discovering: false,
             cached_loading: 0,
+            epoch: 0,
+            found_status: String::new(),
         };
         w.run(rx, &cancel);
         // Closing the persist channel lets the writer finish pending saves and exit.
@@ -156,9 +202,13 @@ impl Worker {
             match ev {
                 Event::Ui(WorkerMsg::Nav(Command::Quit, _)) => break,
                 Event::Ui(WorkerMsg::Nav(cmd, page)) => self.on_nav(cmd, page),
-                Event::Discovered(found) => self.on_discovered(found),
-                Event::Cached(p, meta) => self.on_cached(p, meta),
-                Event::Loaded(p, res) => self.on_loaded(p, res),
+                Event::Discovered {
+                    epoch,
+                    found,
+                    unreadable,
+                } => self.on_discovered(epoch, found, unreadable),
+                Event::Cached { epoch, path, meta } => self.on_cached(epoch, path, meta),
+                Event::Loaded { epoch, path, res } => self.on_loaded(epoch, path, res),
             }
             self.pump_loads();
         }
@@ -199,11 +249,23 @@ impl Worker {
             return;
         }
         self.cached_loading += entries.len();
+        for (p, _) in &entries {
+            self.cache_inflight.insert(p.clone());
+        }
         let cache = self.cfg.cache.clone();
         let tx = self.events.clone();
+        let epoch = self.epoch;
         thread::spawn(move || {
             for (p, e) in entries {
-                if tx.send(Event::Cached(p, cache.load_repo(&e))).is_err() {
+                let meta = cache.load_repo(&e);
+                if tx
+                    .send(Event::Cached {
+                        epoch,
+                        path: p,
+                        meta,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -215,9 +277,28 @@ impl Worker {
         let root = self.cfg.scan_root.clone();
         let opts = self.cfg.discover.clone();
         let tx = self.events.clone();
+        let epoch = self.epoch;
         thread::spawn(move || {
-            let _ = tx.send(Event::Discovered(scan::discover(&root, &opts)));
+            let discovery = scan::discover(&root, &opts);
+            let _ = tx.send(Event::Discovered {
+                epoch,
+                found: discovery.found,
+                unreadable: discovery.unreadable,
+            });
         });
+    }
+
+    /// Drop queued and in-flight work from the previous scan.
+    fn bump_epoch(&mut self) {
+        self.epoch += 1;
+        self.queue.clear();
+        self.in_flight = 0;
+        self.scan_total = 0;
+        self.fresh.clear();
+        self.cache_requested.clear();
+        self.cache_inflight.clear();
+        self.cached_loading = 0;
+        self.found_status.clear();
     }
 
     fn on_nav(&mut self, cmd: Command, page: usize) {
@@ -228,6 +309,7 @@ impl Worker {
             } else {
                 self.app.status = "refreshing…".into();
                 self.cfg.force_rescan = true;
+                self.bump_epoch();
                 self.start_discovery();
             }
         }
@@ -240,23 +322,36 @@ impl Worker {
 
     /// The user opened a repo that is not loaded yet: fetch it before anything else.
     fn request_load(&mut self, p: PathBuf) {
-        if !self.cache_requested.contains(&p)
-            && let Some(e) = self.index.get(&p).cloned()
-        {
-            self.cache_requested.insert(p.clone());
-            self.cached_loading += 1;
-            let cache = self.cfg.cache.clone();
-            let tx = self.events.clone();
-            thread::spawn(move || {
-                let meta = cache.load_repo(&e);
-                let _ = tx.send(Event::Cached(p, meta));
-            });
-            return;
+        let step = open_step(
+            self.app.is_loaded(&p),
+            self.cache_inflight.contains(&p),
+            self.cache_requested.contains(&p),
+            self.index.get(&p).is_some(),
+        );
+        match step {
+            OpenStep::Done | OpenStep::Wait => {}
+            OpenStep::ReadCache => {
+                let Some(e) = self.index.get(&p).cloned() else {
+                    self.request_uncached(p);
+                    return;
+                };
+                self.cache_requested.insert(p.clone());
+                self.cache_inflight.insert(p.clone());
+                self.cached_loading += 1;
+                let cache = self.cfg.cache.clone();
+                let tx = self.events.clone();
+                let epoch = self.epoch;
+                thread::spawn(move || {
+                    let meta = cache.load_repo(&e);
+                    let _ = tx.send(Event::Cached {
+                        epoch,
+                        path: p,
+                        meta,
+                    });
+                });
+            }
+            OpenStep::Disk => self.request_uncached(p),
         }
-        if self.cache_requested.contains(&p) && self.cached_loading > 0 {
-            return; // the pending cache read will deliver it
-        }
-        self.request_uncached(p);
     }
 
     /// Load from disk with top priority, or give up when the repo cannot be reached.
@@ -273,7 +368,10 @@ impl Worker {
         self.scan_total = self.scan_total.max(self.queue.len() + self.in_flight);
     }
 
-    fn on_discovered(&mut self, found: Vec<Found>) {
+    fn on_discovered(&mut self, epoch: u64, found: Vec<Found>, unreadable: usize) {
+        if epoch != self.epoch {
+            return;
+        }
         self.discovering = false;
         let paths: Vec<PathBuf> = found.iter().map(|f| f.path.clone()).collect();
         self.app.set_discovered(&paths, now_unix());
@@ -281,9 +379,9 @@ impl Worker {
 
         let mut todo = scan::needs_load(&found, &self.index, self.cfg.force_rescan);
         self.cfg.force_rescan = false;
-        todo.retain(|p| !self.queue.contains(p));
+        let unchanged = found.len().saturating_sub(todo.len());
         todo.reverse(); // the queue pops from the end
-        self.queue.splice(0..0, todo);
+        self.queue = todo;
         // A repo the user is waiting for goes first.
         if let Some(w) = self.app.awaiting_load()
             && let Some(pos) = self.queue.iter().position(|q| q == &w)
@@ -291,12 +389,17 @@ impl Worker {
             let p = self.queue.remove(pos);
             self.queue.push(p);
         }
-        self.scan_total = self.queue.len() + self.in_flight;
-        self.app.status = format!(
+        self.scan_total = self.queue.len();
+        let mut status = format!(
             "found {} annex repos ({} unchanged since last scan)",
             found.len(),
-            found.len().saturating_sub(self.scan_total)
+            unchanged
         );
+        if unreadable > 0 {
+            status.push_str(&format!(" — {unreadable} directories could not be read"));
+        }
+        self.found_status = status;
+        self.app.status = self.found_status.clone();
         // Changed repos still show their cached data until the reload finishes.
         let cached: Vec<PathBuf> = paths
             .into_iter()
@@ -307,7 +410,11 @@ impl Worker {
         self.send_background();
     }
 
-    fn on_cached(&mut self, p: PathBuf, meta: Option<AnnexMetadata>) {
+    fn on_cached(&mut self, epoch: u64, p: PathBuf, meta: Option<AnnexMetadata>) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.cache_inflight.remove(&p);
         self.cached_loading = self.cached_loading.saturating_sub(1);
         match meta {
             Some(meta) if !self.fresh.contains(&p) => {
@@ -323,7 +430,10 @@ impl Worker {
         self.send_background();
     }
 
-    fn on_loaded(&mut self, p: PathBuf, res: Result<AnnexMetadata>) {
+    fn on_loaded(&mut self, epoch: u64, p: PathBuf, res: Result<AnnexMetadata>) {
+        if epoch != self.epoch {
+            return;
+        }
         self.in_flight = self.in_flight.saturating_sub(1);
         match res {
             Ok(meta) => {
@@ -350,6 +460,7 @@ impl Worker {
 
     fn pump_loads(&mut self) {
         let mut started = false;
+        let epoch = self.epoch;
         while self.in_flight < self.cfg.jobs.max(1) {
             let Some(p) = self.queue.pop() else {
                 break;
@@ -359,7 +470,11 @@ impl Worker {
             let tx = self.events.clone();
             thread::spawn(move || {
                 let res = crate::annex::load_metadata(&p);
-                let _ = tx.send(Event::Loaded(p, res));
+                let _ = tx.send(Event::Loaded {
+                    epoch,
+                    path: p,
+                    res,
+                });
             });
         }
         if started {
@@ -370,9 +485,25 @@ impl Worker {
     fn update_progress(&mut self) {
         let remaining = self.queue.len() + self.in_flight;
         self.app.scanning = self.discovering || remaining > 0 || self.cached_loading > 0;
+        if self.discovering {
+            return;
+        }
         if remaining > 0 && self.scan_total > 0 {
             let done = self.scan_total.saturating_sub(remaining);
-            self.app.status = format!("scanning {done}/{}…", self.scan_total);
+            if self.found_status.is_empty() {
+                self.app.status = format!("scanning {done}/{}…", self.scan_total);
+            } else {
+                self.app.status = format!(
+                    "{} — scanning {done}/{}…",
+                    self.found_status, self.scan_total
+                );
+            }
+        } else if !self.found_status.is_empty()
+            && self.queue.is_empty()
+            && self.in_flight == 0
+            && self.scan_total == 0
+        {
+            self.app.status = self.found_status.clone();
         }
     }
 
@@ -385,6 +516,17 @@ impl Worker {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn cache_miss_is_not_stuck_behind_other_reads() {
+        // Indexed, already requested, not in flight, not loaded: read from disk.
+        assert_eq!(open_step(false, false, true, true), OpenStep::Disk);
+        // This path's own cache read is still running.
+        assert_eq!(open_step(false, true, true, true), OpenStep::Wait);
+        // First open of an indexed repo reads the cache.
+        assert_eq!(open_step(false, false, false, true), OpenStep::ReadCache);
+        assert_eq!(open_step(true, false, true, true), OpenStep::Done);
+    }
 
     fn config(root: &std::path::Path, cache: &std::path::Path, offline: bool) -> WorkerConfig {
         WorkerConfig {
